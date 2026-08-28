@@ -8,7 +8,7 @@
 ## 架构
 
 ```
-GitHub Actions（交易日 19:00 北京时间）
+GitHub Actions（每个交易日收盘后的次日凌晨 00:30 北京时间）
   └─ scripts/run_daily.py
        ├─ fetch_weights.py        当月权重快照（历史月度权重为静态文件）
        ├─ fetch_index_prices.py   指数日线（新浪）
@@ -46,7 +46,7 @@ streamlit run app.py                 # 启动看板
 
 ## 部署
 
-1. **数据自动更新**：仓库自带 `.github/workflows/daily_update.yml`，push 后即生效，每个交易日北京时间 19:00 自动运行并 commit 更新后的数据。
+1. **数据自动更新**：仓库自带 `.github/workflows/daily_update.yml`，push 后即生效，每个交易日收盘后次日凌晨 00:30（北京时间）自动运行并 commit 更新后的数据。
 2. **Streamlit 看板**：在 [share.streamlit.io](https://share.streamlit.io) 用 GitHub 账号登录 → New app → 选择本仓库 → 主模块填 `app.py` → Deploy。此后随数据 commit 自动刷新。
 
 ## 口径速览

@@ -2,7 +2,7 @@ name: daily_update
 
 on:
   schedule:
-    - cron: "0 11 * * 1-5"   # UTC 11:00 = 北京时间 19:00（交易日盘后）
+    - cron: "30 16 * * 0-4"  # UTC 16:30 (周日~周四) = 北京时间 00:30 (周一~周六)，覆盖全部5个交易日收盘后的次日凌晨更新
   workflow_dispatch:
 
 permissions:
