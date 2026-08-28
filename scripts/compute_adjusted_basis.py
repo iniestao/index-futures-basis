@@ -246,13 +246,13 @@ def main(end_date=None, out_suffix=""):
                     continue
                 true_sel = sel_mask & (E_ANN <= tr)
                 pred_sel = sel_mask & ~true_sel
-                true_part = (w_by_event[true_sel] * YT[true_sel] / 100.0).sum()
+                true_part = np.nansum(w_by_event[true_sel] * YT[true_sel] / 100.0)
                 cover = np.nan
                 out_row_base = dict(date=dstr, product=prod, role=role, contract=sym,
                                     expire=T_day.isoformat(), spot=S, future=Fv,
                                     basis_raw=Fv - S)
                 for k, ycol in (("y", "y_fix_y"), ("d", "y_fix_d"), ("p", "y_fix_p")):
-                    pred_part = (w_by_event[pred_sel] * YPx[ycol][pred_sel] / 100.0).sum()
+                    pred_part = np.nansum(w_by_event[pred_sel] * YPx[ycol][pred_sel] / 100.0)
                     tot = true_part + pred_part
                     dpv_pts = tot * S
                     cov = true_part / tot if tot > 0 else np.nan
