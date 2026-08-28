@@ -6,7 +6,7 @@ import streamlit as st
 
 st.set_page_config(page_title="股指期货剔除分红基差", page_icon="📊", layout="wide")
 
-OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 PRODUCTS = {"IF": "沪深300", "IH": "上证50", "IC": "中证500", "IM": "中证1000"}
 CALIBRES = {"y": "固定股息率", "d": "固定分红", "p": "固定派息率"}
 COLORS = {"IF": "#1565C0", "IH": "#00897B", "IC": "#F9A825", "IM": "#E53935"}
