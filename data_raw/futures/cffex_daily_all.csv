@@ -1,4 +1,4 @@
-date,symbol,open,high,low,close,settle,pre_settle,volume,open_interest
+﻿date,symbol,open,high,low,close,settle,pre_settle,volume,open_interest
 20150105,IF1501,3619.0,3768.8,3585.2,3671.4,3718.6,3579.8,1303810,138633.0
 20150105,IF1502,3645.0,3817.6,3636.0,3726.8,3766.0,3622.8,31115,10631.0
 20150105,IF1503,3681.0,3860.2,3677.4,3766.0,3807.8,3656.2,117300,60335.0
@@ -37427,3 +37427,4 @@ date,symbol,open,high,low,close,settle,pre_settle,volume,open_interest
 20260827,IM2610,7448.0,7631.8,7410.0,7624.0,7609.4,7422.8,7492,11112.0
 20260827,IM2612,7300.0,7484.0,7261.2,7479.0,7457.8,7276.4,51147,137234.0
 20260827,IM2703,7090.0,7280.0,7058.2,7273.6,7254.8,7072.2,19387,60809.0
+date,symbol,open,high,low,close,settle,pre_settle,volume,open_interest
