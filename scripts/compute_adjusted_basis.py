@@ -177,8 +177,9 @@ def main(end_date=None, out_suffix=""):
     fut = pd.read_csv(FUT_CSV, header=None,
                       names=["date", "symbol", "open", "high", "low", "close",
                              "settle", "pre_settle", "volume", "open_interest"],
-                      dtype={"date": str, "symbol": str})
-    fut = fut[fut["symbol"] != "__FAIL__"]
+                      dtype={"date": str, "symbol": str}, encoding="utf-8-sig", skiprows=1)
+    fut = fut[fut["date"].astype(str).str.match(r"^\d{8}$", na=False)]
+    fut = fut[fut["symbol"].astype(str).str.match(r"^(IF|IH|IC|IM)\d{4}$", na=False)]
     fut["date"] = pd.to_datetime(fut["date"].astype(str), format="%Y%m%d", errors="coerce").dt.strftime("%Y-%m-%d")
     fut["close"] = pd.to_numeric(fut["close"], errors="coerce")
 

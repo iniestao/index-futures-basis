@@ -10,9 +10,7 @@ import akshare as ak
 def main():
     for prod, cfg in PRODUCTS.items():
         out_path = os.path.join(RAW, "index", f"{prod}_{cfg['sina_idx']}.csv")
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
-            print(f"[SKIP] {prod} index exists")
-            continue
+        # 每次全量重抓（单指数十年日线仅数百KB，覆盖式写入保证增量更新）
         for attempt in range(3):
             try:
                 df = ak.stock_zh_index_daily(symbol=cfg["sina_idx"])
