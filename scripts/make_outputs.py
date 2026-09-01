@@ -9,7 +9,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+# 字体兜底链：Windows 命中微软雅黑，Linux/CI 命中 Noto CJK（GitHub runner 预装），避免 findfont warning 和中文方框
+plt.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Noto Sans CJK JP",
+    "WenQuanYi Zen Hei", "DejaVu Sans",
+]
 plt.rcParams["axes.unicode_minus"] = False
 COLORS = {"IF": "#1565C0", "IH": "#00897B", "IC": "#F9A825", "IM": "#E53935"}
 

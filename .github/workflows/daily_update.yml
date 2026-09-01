@@ -25,7 +25,10 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          # 中文字体（图表渲染用；runner 通常已预装，此处确保存在）
+          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
 
       - name: Run daily pipeline
         run: python scripts/run_daily.py

@@ -23,7 +23,7 @@ def main():
     ok &= run("fetch_index_prices.py")
     # 3. 中金所月度包：默认只补当前月与上一月
     ok &= run("fetch_cffex_monthly.py")
-    # 4. 分红明细：增量（mtime 超过 20h 的股票重抓）
+    # 4. 分红明细：内容驱动轮转刷新（活跃股每2天一刷，沉睡股每10天一刷，不依赖 mtime）
     ok &= run("fetch_dividends.py")
     # 5. 年报 EPS：最近两年报告期
     ok &= run("fetch_eps_annual.py")
