@@ -5,3 +5,6 @@ __pycache__/
 
 # 运行时失败日志
 data_raw/dividends/_*
+
+# 运行时失败日志（个股日线）
+data_raw/stock_prices/_*

@@ -29,6 +29,9 @@ def main():
     ok &= run("fetch_eps_annual.py")
     # 5b. 季报 EPS（累计值 + 披露日）：pq 口径所需，历史只补缺失、最近2期刷新
     ok &= run("fetch_eps_quarterly.py")
+    # 5c. 个股日线（不复权收盘价）：每日权重的流通市值漂移所需。
+    #     首次运行为全量回补（universe 缺口），之后每日只增量刷新当前成分
+    ok &= run("fetch_stock_prices.py")
     # 6. 计算
     ok &= run("compute_adjusted_basis.py")
     ok &= run("compute_backtest.py")

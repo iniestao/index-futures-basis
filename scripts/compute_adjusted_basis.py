@@ -8,7 +8,9 @@ B_adj = B + DPV = F − (S − DPV)，DPV 点数 = Σ w_i(t) × y_i × S_t
 """
 import io, os, sys, glob, math, datetime as dt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import RAW, OUT, PRODUCTS, START, END, month_range, third_friday, env_setup
+from config import (RAW, OUT, PRODUCTS, START, END, month_range, third_friday,
+                    env_setup, INDEX_MEMBERS)
+from weight_daily import daily_weight_matrix
 env_setup()
 import numpy as np
 import pandas as pd
@@ -100,9 +102,32 @@ def four_contracts_for_day(date: dt.date):
     return [cur, nxt] + qs
 
 # ---------- 权重时间线 ----------
-def load_weight_timeline(index_code):
+def repair_weights(wmap, deficit, omitted_code=None):
+    """
+    修复权重文件的整行缺失。
+
+    背景：Wind 导出的中证月末权重文件把**代码最小的那只成分股**整行丢了
+    （实测 139/141 期行数比指数成分数少 1，IF 全期缺 000001.SZ，IH 2015 年缺口达 4.5% 权重），
+    导致该期 DPV 系统性低估。缺口 = 100 − Σ(文件权重) 即缺失成分的权重。
+
+    修复策略：
+      1) 若能确定被省略的代码（在完整期出现、且所有缺行期都不出现）→ 原样补回并赋缺口权重；
+      2) 否则按缺口把文件内权重归一到 100 —— 等价于「给缺失成分按指数平均股息率插补」，
+         在缺失成分股息率≈指数平均时严格正确，误差远小于整体遗漏。
+    """
+    if deficit <= 0.05:
+        return wmap, None
+    if omitted_code and 0.05 <= deficit <= 3.0:
+        wmap = dict(wmap)
+        wmap[omitted_code] = deficit
+        return wmap, f"补回{omitted_code}"
+    k = 100.0 / (100.0 - deficit)
+    return {c: w * k for c, w in wmap.items()}, f"归一×{k:.5f}"
+
+
+def load_weight_timeline(index_code, repair=True):
     """返回 sorted [(month_end 'YYYY-MM-DD', {code6: w_pct})] + 快照 fallback"""
-    tl = []
+    tl, nrow, raw = [], {}, {}
     w_dir = os.path.join(RAW, "weights")
     for fp in glob.glob(os.path.join(w_dir, f"{index_code}.SH_*.csv")):
         base = os.path.basename(fp)
@@ -114,11 +139,44 @@ def load_weight_timeline(index_code):
             df["_code"] = df["wind_code"].astype(str).str[:6]
             df["i_weight"] = pd.to_numeric(df["i_weight"], errors="coerce")
             df = df[df["i_weight"].notna() & (df["i_weight"] > 0)]
-            tl.append((month_end, dict(zip(df["_code"], df["i_weight"]))))
+            wmap = dict(zip(df["_code"], df["i_weight"]))
+            raw[month_end] = wmap
+            nrow[month_end] = len(df)
+            tl.append((month_end, wmap))
         except Exception:
             continue
     tl.sort(key=lambda x: x[0])
-    return tl
+    if not repair or not tl:
+        return tl
+
+    exp = INDEX_MEMBERS.get(index_code)
+    if not exp:
+        return tl
+    full_sets = [set(w) for m, w in tl if nrow[m] >= exp]
+    short = [m for m, _ in tl if nrow[m] < exp]
+    # 被整表省略的代码：完整期都含、且所有缺行期都不含
+    cand = set(full_sets[0]).intersection(*full_sets) if full_sets else set()
+    for m in short:
+        cand -= set(raw[m])
+    omitted = sorted(cand)[0] if len(cand) == 1 else None
+
+    fixed, fix_n, ins_n = [], 0, 0
+    for m, wmap in tl:
+        deficit = 100.0 - sum(wmap.values())
+        if nrow[m] < exp and deficit > 0.05:
+            newmap, how = repair_weights(wmap, deficit, omitted)
+            if how:
+                fix_n += 1
+                if how.startswith("补回"):
+                    ins_n += 1
+            fixed.append((m, newmap))
+        else:
+            fixed.append((m, wmap))
+    if fix_n:
+        print(f"  [权重修复] {index_code}: {fix_n}/{len(tl)} 期整行缺失已修复"
+              f"（补回代码 {ins_n} 期{('/ ' + omitted) if omitted else '，其余按缺口归一'}"
+              f"）；平均缺口 {100.0 - sum(sum(w.values()) for _, w in tl) / len(tl):.3f}", flush=True)
+    return fixed
 
 def load_snapshot_weights(index_code):
     fp = os.path.join(RAW, "weights", f"{index_code}_weights.csv")
@@ -308,13 +366,33 @@ def main(end_date=None, out_suffix=""):
         n_m = len(timeline)
         print(f"  weight months={n_m}, snapshot fallback={'yes' if n_m == 0 else 'no'}", flush=True)
 
+        # 每日权重（流通市值近似）：锚定月末官方权重，期内按个股流通市值相对变动漂移
+        W_daily, AXPOS_E = None, None
+        if os.environ.get("STATIC_WEIGHTS", "").lower() not in ("1", "true", "yes"):
+            try:
+                W_daily, w_axis = daily_weight_matrix(dates, timeline, snapshot, codes)
+            except Exception as e:
+                W_daily = None
+                print(f"  [WARN] daily weights unavailable ({type(e).__name__}: {e})", flush=True)
+            if W_daily is not None:
+                ax_pos = {c: i for i, c in enumerate(w_axis)}
+                AXPOS_E = np.array([ax_pos.get(c, -1) for c in codes], dtype=int)[E_CODE]
+                print(f"  daily weights ON (axis={len(w_axis)}, 覆盖事件权重 "
+                      f"{100.0 * (AXPOS_E >= 0).mean():.1f}%)", flush=True)
+        if W_daily is None:
+            print("  daily weights OFF -> month-end static weights", flush=True)
+
         recs = []
         for ti, dstr in enumerate(dates):
             dd = dt.date.fromisoformat(dstr)
             tr = float((dd - dser0).days)
             S = closes[ti]
-            w_vec = get_weight_vec(dstr, timeline, snapshot, codes)
-            w_by_event = w_vec[E_CODE]     # 事件对齐权重（当月非成分=0，天然剔除）
+            if W_daily is not None:
+                row = W_daily[ti]
+                w_by_event = np.where(AXPOS_E >= 0, row[np.clip(AXPOS_E, 0, None)], 0.0)
+            else:
+                w_vec = get_weight_vec(dstr, timeline, snapshot, codes)
+                w_by_event = w_vec[E_CODE]     # 事件对齐权重（当月非成分=0，天然剔除）
             contracts = four_contracts_for_day(dd)
             for role_i, ym in enumerate(contracts):
                 role = ["current", "next", "q1", "q2"][role_i]

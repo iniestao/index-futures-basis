@@ -16,10 +16,11 @@ GitHub Actions（每个交易日收盘后的次日凌晨 00:30 北京时间）
        ├─ fetch_dividends.py      分红明细（东财 F10，内容驱动轮转：活跃股2天一刷/沉睡股10天一刷）
        ├─ fetch_eps_annual.py     年报 EPS（东财业绩报表）
        ├─ fetch_eps_quarterly.py  季报累计 EPS + 披露日（pq 口径输入）
-       ├─ compute_adjusted_basis.py   四口径 DPV + 调整基差
+       ├─ fetch_stock_prices.py   个股不复权日 K（每日权重输入；首次全量、其后增量刷新当前成分）
+       ├─ compute_adjusted_basis.py   四口径 DPV + 调整基差（月末锚定 + 每日流通市值权重）
        ├─ compute_backtest.py         样本外回测
        ├─ make_outputs.py             Excel + 图表
-       └─ check_data_quality.py       数据质量护栏（隐含股息率/覆盖率，告警不阻断）
+       └─ check_data_quality.py       数据质量护栏（隐含股息率/覆盖/结构，告警不阻断）
   └─ 自动 commit → Streamlit Cloud 看板自动刷新
 ```
 
@@ -33,6 +34,7 @@ GitHub Actions（每个交易日收盘后的次日凌晨 00:30 北京时间）
 │   ├── index/                 指数日线
 │   ├── futures/               期货日线（中金所官方）
 │   ├── dividends/             分红明细（每股一文件）
+│   ├── stock_prices/          个股不复权收盘价（close_YYYY.csv，日期×代码宽表）
 │   ├── eps_annual.csv         年报 EPS
 │   └── eps_quarterly.csv      季报累计 EPS（含披露日）
 ├── output/                    调整基差面板 / 回测 / 图表 / 数据质量报告
@@ -65,9 +67,11 @@ streamlit run app.py                 # 启动看板
 
 四个口径并列输出，不做自动选择（由使用者按品种/用途判断）。`pq` 用季报 TTM 外推下一财年 EPS，比 `p` 的「上年年报 EPS」更及时。
 
+**权重**：中证只公开月末权重，故以月末官方权重为**锚点**，期内用个股流通市值（不复权收盘价 × 送转修正）的相对变动把权重漂移到每日，归一化分母含全部成分股。价格覆盖率不足 50% 时自动回退月末静态权重（`STATIC_WEIGHTS=1` 可强制回退）。另对月末文件的**整行缺失**（139/141 期，Wind 导出恒定丢掉代码最小的成分股）自动修复：IF 补回 000001 并赋缺口权重，其余指数按缺口归一到 100。详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md) 第 5 节。
+
 ## 数据质量
 
-每次运行产出 `output/data_quality_report.csv`：年度隐含股息率（DPV 折算）是否落在各品种合理带内、分红文件覆盖率、已公告覆盖率。异常打印 Actions 注解并在看板「数据质量校验」中展示，不阻断流水线。详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md) 第 4 节。
+每次运行产出 `output/data_quality_report.csv`（年度隐含股息率是否落在品种合理带内、分红/已公告覆盖率）与 `output/data_quality_structure.csv`（月末权重文件成分数与合计、个股价格面板覆盖率）。异常打印 Actions 注解并在看板「数据质量校验」中展示，不阻断流水线。详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md) 第 4 节。
 
 ## License
 

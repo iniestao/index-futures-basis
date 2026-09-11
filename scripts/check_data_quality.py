@@ -11,7 +11,7 @@
 """
 import os, sys, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import RAW, OUT, PRODUCTS, env_setup
+from config import RAW, OUT, PRODUCTS, env_setup, INDEX_MEMBERS
 env_setup()
 import numpy as np
 import pandas as pd
@@ -52,6 +52,73 @@ def div_file_coverage(product, index_code):
         if os.path.exists(fp) and os.path.getsize(fp) > 50:
             have += 1
     return have / len(members), have, len(members)
+
+
+EXPECT_N = INDEX_MEMBERS
+MIN_PRICE_COV = 0.5     # 每日权重生效所需的价格覆盖率下限（与 weight_daily 保持一致）
+
+
+def structure_checks():
+    """结构检查：月末权重文件完整性 + 个股价格面板覆盖（每日权重的前提）"""
+    rows, warns = [], []
+
+    rows.append(dict(item="月末权重文件", value="", status="", note="整行缺失由引擎自动修复（补回或按缺口归一）"))
+    for prod, cfg in PRODUCTS.items():
+        idx = cfg["index"]
+        files = sorted(glob.glob(os.path.join(RAW, "weights", f"{idx}.SH_*.csv")))
+        exp = EXPECT_N.get(idx, 0)
+        short, max_def = 0, 0.0
+        for fp in files:
+            try:
+                df = pd.read_csv(fp)
+                w = pd.to_numeric(df["i_weight"], errors="coerce")
+            except Exception:
+                continue
+            if exp and len(df) < exp:
+                short += 1
+                max_def = max(max_def, 100.0 - w.sum())
+        note = ""
+        if short:
+            note = (f"行数少于成分数（最多缺 {max_def:.2f} 权重），引擎已自动修复；"
+                    f"未修复则该期 DPV 会低估同等比例")
+        rows.append(dict(item=f"  {prod} {idx}", value=f"{len(files)} 期 / 整行缺失 {short} 期",
+                         status="WARN" if short else "OK", note=note))
+        if short:
+            warns.append(f"{prod} 月末权重文件 {short}/{len(files)} 期整行缺失（最多 {max_def:.2f} 权重），已自动修复")
+
+    # 个股价格面板（每日权重数据源）
+    pfiles = sorted(glob.glob(os.path.join(RAW, "stock_prices", "close_*.csv")))
+    if not pfiles:
+        rows.append(dict(item="个股价格面板", value="缺失", status="WARN",
+                         note="data_raw/stock_prices 为空 → 每日权重自动回退为月末静态权重"))
+        warns.append("个股价格面板缺失，每日权重未生效")
+    else:
+        codes, last = set(), ""
+        for fp in pfiles:
+            try:
+                head = pd.read_csv(fp, nrows=1, dtype={0: str})
+                codes |= {c for c in head.columns if c != head.columns[0]}
+            except Exception:
+                continue
+        for fp in reversed(pfiles):
+            try:
+                tail = pd.read_csv(fp, usecols=[0])
+                if len(tail):
+                    last = str(tail.iloc[-1, 0])
+                    break
+            except Exception:
+                continue
+        uni_fp = os.path.join(RAW, "universe_all.csv")
+        uni = set(pd.read_csv(uni_fp, dtype={"stock_code": str})["stock_code"]) if os.path.exists(uni_fp) else set()
+        cov = len(codes & uni) / len(uni) if uni else np.nan
+        st = "OK" if np.isfinite(cov) and cov >= MIN_PRICE_COV else "WARN"
+        note = f"最新交易日 {last}"
+        if st == "WARN":
+            note += f"；覆盖率 <{MIN_PRICE_COV*100:.0f}% → 未覆盖个股漂移记 1.0（权重不动），日内权重为部分更新"
+            warns.append(f"个股价格覆盖 {cov*100:.1f}% 低于阈值")
+        rows.append(dict(item="个股价格面板", value=f"{len(codes & uni)}/{len(uni)} 只 ({cov*100:.1f}%)",
+                         status=st, note=note))
+    return pd.DataFrame(rows), warns
 
 
 def main():
@@ -113,6 +180,15 @@ def main():
     rep = pd.DataFrame(rows)
     out_fp = os.path.join(OUT, "data_quality_report.csv")
     rep.to_csv(out_fp, index=False, encoding="utf-8-sig")
+
+    # 结构检查（权重文件完整性 / 价格面板覆盖）
+    st_rep, st_warns = structure_checks()
+    st_rep.to_csv(os.path.join(OUT, "data_quality_structure.csv"), index=False, encoding="utf-8-sig")
+    print("[结构检查]")
+    for _, r in st_rep.iterrows():
+        print(f"  {r['item']}: {r['value']} {r['status']} {r['note']}")
+    for w in st_warns:
+        print(f"::warning title=数据质量::{w}")
 
     if not len(rep):
         print("[WARN] data quality report is empty")

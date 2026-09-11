@@ -17,6 +17,9 @@ PRODUCTS = {
     "IM": dict(index="000852", sina_idx="sh000852", first_month=202207),  # IM 2022-07 上市
 }
 
+# 各指数成分股数（用于识别权重文件是否整行缺失）
+INDEX_MEMBERS = {"000300": 300, "000016": 50, "000905": 500, "000852": 1000}
+
 def env_setup():
     """数据源全部为公开站点；如本地网络需要代理，请自行 export HTTPS_PROXY/HTTP_PROXY。"""
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
