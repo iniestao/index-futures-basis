@@ -60,20 +60,38 @@ def make_charts(full):
     ax.grid(alpha=0.25)
     p3 = os.path.join(OUT, "chart_coverage_if.png")
     plt.tight_layout(); plt.savefig(p3); plt.close()
-    return [p1, p2, p3]
+    # 季报外推 EPS 口径 vs 上年年报 EPS 口径（当月合约 DPV 对比）
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.2), dpi=130)
+    for ax, prod in zip(axes, ["IF", "IC"]):
+        piv = (full[(full["product"] == prod) & (full["role"] == "current")]
+               .pivot_table(index="date", columns="calibre", values="dpv_pts"))
+        for k, lab, col in (("p", "p 口径（上年年报EPS）", "#9E9E9E"),
+                            ("pq", "pq 口径（季报外推EPS）", COLORS[prod])):
+            if k in piv.columns:
+                ax.plot(piv.index, piv[k], lw=1.0, label=lab, color=col)
+        ax.set_title(f"{prod} 当月合约 DPV：年报EPS vs 季报外推EPS（点）", fontsize=10)
+        ax.legend(fontsize=8); ax.grid(alpha=0.25)
+        ticks = piv.index[::max(len(piv) // 6, 1)]
+        ax.set_xticks(ticks); ax.set_xticklabels([d[:7] for d in ticks], rotation=30, fontsize=7)
+    p4 = os.path.join(OUT, "chart_eps_calibre.png")
+    plt.tight_layout(); plt.savefig(p4); plt.close()
+    return [p1, p2, p3, p4]
 
 def main():
     full = load_all()
     pngs = make_charts(full)
     readme = pd.DataFrame({
         "说明": [
-            "股指期货剔除分红基差流水线 V1.0-rev1 交付包",
-            "口径：B_adj = 表观基差B + DPV = F − (S − DPV)；DPV点数 = Σ w×股息率 × S_t（w=中证月末权重快照20260731）",
-            "预测口径：已公告(预案公告日≤t)用真值，未公告用上年递推；est_ex=真实除息日或预案日+个股三年中位间隔；无前视模拟",
-            "数据源：现货/期货=get_cffex_daily与新浪指数日线(公开)；分红=东财F10(akshare)；权重=中证官网月末文件",
+            "股指期货剔除分红基差流水线 V1.1 交付包",
+            "口径：B_adj = 表观基差B + DPV = F − (S − DPV)；DPV点数 = Σ w_i(t) × 股息率_i × S_t",
+            "权重：中证官网月末历史权重文件（t 日取 ≤t 最近月末，缺失月回退快照），非当前快照近似",
+            "分红分层：已实施→真值；预案公告日≤t→公告值；未公告→各口径外推（无前视信息集）",
+            "四口径：y=3年均值股息率 | d=3年均值分红 | p=3年均值派息率×上年年报EPS | pq=3年均值派息率×季报外推EPS(TTM)",
+            "数据源：现货/期货=中金所官网(公开)；分红=东财F10；季报EPS=东财业绩报表；权重=中证指数公司",
             "字段：basis_raw表观基差 | dpv_pts分红点数 | basis_adj剔分红外基差 | annualized_rate年化%(单利365/自然日)",
             "announced_ratio：DPV中真值部分占比（低=预测主导，谨慎解读）；IM自2022-07上市",
-            "局限：权重为当前快照(业界通行做法)，远端历史存在近似误差；未公告递推对突变行为滞后",
+            "数据质量sheet：年度隐含股息率带内校验 + 分红文件覆盖率，WARN 需人工确认",
+            "局限：已退市股票分红无法从免费渠道获取（早期成分分红可能低估）；未公告外推对突变分红行为滞后",
             "版本时间：" + __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M"),
         ]
     })
@@ -95,7 +113,10 @@ def main():
         both.to_excel(w, sheet_name="主力序列对照(固定股息率)", index=True)
         bt_path = os.path.join(OUT, "backtest_2025_calibres.csv")
         if os.path.exists(bt_path):
-            pd.read_csv(bt_path).to_excel(w, sheet_name="回测_2025三口径", index=False)
+            pd.read_csv(bt_path).to_excel(w, sheet_name="回测_2025各口径", index=False)
+        q_path = os.path.join(OUT, "data_quality_report.csv")
+        if os.path.exists(q_path):
+            pd.read_csv(q_path).to_excel(w, sheet_name="数据质量校验", index=False)
         weights_example.head(320).to_excel(w, sheet_name="权重快照样例_IF", index=False)
     print("[OK] excel ->", xlsx_path)
     print("[OK] charts ->", pngs)

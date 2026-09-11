@@ -10,14 +10,16 @@
 ```
 GitHub Actions（每个交易日收盘后的次日凌晨 00:30 北京时间）
   └─ scripts/run_daily.py
-       ├─ fetch_weights.py        当月权重快照（历史月度权重为静态文件）
+       ├─ fetch_weights.py        当月权重快照 + 最新月末权重落库（历史月度权重为静态文件）
        ├─ fetch_index_prices.py   指数日线（新浪）
        ├─ fetch_cffex_monthly.py  期货日线（中金所官网月度 zip，增量补当月）
-       ├─ fetch_dividends.py      分红明细（东财 F10，增量：mtime>20h 重抓）
+       ├─ fetch_dividends.py      分红明细（东财 F10，内容驱动轮转：活跃股2天一刷/沉睡股10天一刷）
        ├─ fetch_eps_annual.py     年报 EPS（东财业绩报表）
-       ├─ compute_adjusted_basis.py   三口径 DPV + 调整基差
+       ├─ fetch_eps_quarterly.py  季报累计 EPS + 披露日（pq 口径输入）
+       ├─ compute_adjusted_basis.py   四口径 DPV + 调整基差
        ├─ compute_backtest.py         样本外回测
-       └─ make_outputs.py             图表
+       ├─ make_outputs.py             Excel + 图表
+       └─ check_data_quality.py       数据质量护栏（隐含股息率/覆盖率，告警不阻断）
   └─ 自动 commit → Streamlit Cloud 看板自动刷新
 ```
 
@@ -31,8 +33,9 @@ GitHub Actions（每个交易日收盘后的次日凌晨 00:30 北京时间）
 │   ├── index/                 指数日线
 │   ├── futures/               期货日线（中金所官方）
 │   ├── dividends/             分红明细（每股一文件）
-│   └── eps_annual.csv         年报 EPS
-├── output/                    调整基差面板 / 回测 / 图表
+│   ├── eps_annual.csv         年报 EPS
+│   └── eps_quarterly.csv      季报累计 EPS（含披露日）
+├── output/                    调整基差面板 / 回测 / 图表 / 数据质量报告
 └── docs/METHODOLOGY.md        方法论
 ```
 
@@ -58,7 +61,13 @@ streamlit run app.py                 # 启动看板
 | basis_adj | 剔除分红基差 = basis_raw + dpv_pts |
 | annualized_rate | 年化调整基差率（单利，365/自然日） |
 | announced_ratio | DPV 中已公告（真值）部分占比 |
-| calibre | 分红预测口径：y=固定股息率 / d=固定分红 / p=固定派息率 |
+| calibre | 分红预测口径：y=固定股息率 / d=固定分红 / p=固定派息率 / pq=派息率×季报外推EPS |
+
+四个口径并列输出，不做自动选择（由使用者按品种/用途判断）。`pq` 用季报 TTM 外推下一财年 EPS，比 `p` 的「上年年报 EPS」更及时。
+
+## 数据质量
+
+每次运行产出 `output/data_quality_report.csv`：年度隐含股息率（DPV 折算）是否落在各品种合理带内、分红文件覆盖率、已公告覆盖率。异常打印 Actions 注解并在看板「数据质量校验」中展示，不阻断流水线。详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md) 第 4 节。
 
 ## License
 

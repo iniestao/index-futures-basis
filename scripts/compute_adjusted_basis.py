@@ -15,6 +15,68 @@ import pandas as pd
 
 DIV_DIR = os.path.join(RAW, "dividends")
 FUT_CSV = os.path.join(RAW, "futures", "cffex_daily_all.csv")
+EPS_Q_CSV = os.path.join(RAW, "eps_quarterly.csv")
+
+
+# ---------- 季报 EPS（用于 pq 口径） ----------
+def load_eps_quarterly():
+    """
+    季报累计 EPS → {code: [(notice_ord, report_year, report_month, eps_cum), ...]}
+    仅保留「公告日 ≤ 使用时刻」的记录，保证无前视。
+    """
+    if not os.path.exists(EPS_Q_CSV):
+        return {}
+    try:
+        df = pd.read_csv(EPS_Q_CSV, dtype={"stock_code": str})
+    except Exception:
+        return {}
+    need = {"stock_code", "report_date", "eps_cum", "notice_date"}
+    if not need.issubset(df.columns):
+        return {}
+    df["notice_date"] = pd.to_datetime(df["notice_date"], errors="coerce")
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
+    df["eps_cum"] = pd.to_numeric(df["eps_cum"], errors="coerce")
+    df = df[df["notice_date"].notna() & df["report_date"].notna() & df["eps_cum"].notna()]
+    out = {}
+    for c, g in df.groupby("stock_code", sort=False):
+        g = g.sort_values(["report_date", "notice_date"])
+        out[c] = [(r.notice_date, r.report_date.year, r.report_date.month, float(r.eps_cum))
+                  for r in g.itertuples()]
+    return out
+
+
+def _ttm(avail, year, mth, cum_now):
+    """TTM run-rate：上年全年 + 本期累计 − 上年同期累计；上年同期缺失时退化为累计年化"""
+    if mth == 12:
+        return cum_now
+    ann_prev = [r for r in avail if r[1] == year - 1 and r[2] == 12]
+    base_prev = [r for r in avail if r[1] == year - 1 and r[2] == mth]
+    if ann_prev and base_prev:
+        return cum_now + ann_prev[-1][3] - base_prev[-1][3]
+    return cum_now * 12.0 / mth if mth else np.nan
+
+
+def eps_est_asof(qrows, asof, target_year):
+    """
+    信息集 ≤ asof 时，对 target_year 财年 EPS 的估计（季报外推，无前视）：
+      1) 目标年度年报已披露 → 用实际值
+      2) 目标年度有季报（Q1/H1/Q3）→ TTM 外推：上年全年 + 本期累计 − 上年同期累计
+      3) 目标年度尚无披露 → 用最近可得报告期的 TTM run-rate（比只用上年年报更及时）
+    """
+    if not qrows or asof is None or pd.isna(asof):
+        return np.nan
+    avail = [r for r in qrows if r[0] <= asof]
+    if not avail:
+        return np.nan
+    ann_t = [r for r in avail if r[1] == target_year and r[2] == 12]
+    if ann_t:
+        return ann_t[-1][3]
+    cur = [r for r in avail if r[1] == target_year]
+    if cur:
+        last = max(cur, key=lambda r: (r[2], r[0]))
+        return _ttm(avail, target_year, last[2], last[3])
+    latest = max(avail, key=lambda r: (r[1], r[2]))
+    return _ttm(avail, latest[1], latest[2], latest[3])
 
 # ---------- 合约规则 ----------
 def roll_contract(today_ym, months_ahead):
@@ -119,8 +181,10 @@ def load_events(product, index_code):
     ev = ev.sort_values(["code", "ann"]).reset_index(drop=True)
 
     # ---- 四种预测收益率（均为信息集内无前视）----
-    col_v0, col_y, col_d, col_p = [], [], [], []
+    qeps = load_eps_quarterly()
+    col_v0, col_y, col_d, col_p, col_pq, col_epsq = [], [], [], [], [], []
     for c, g in ev.groupby("code", sort=False):
+        qrows = qeps.get(c, [])
         y_arr = g["yield_dec"].to_numpy(float)
         d_arr = g["dps"].to_numpy(float)
         e_arr = g["eps"].to_numpy(float)
@@ -135,7 +199,8 @@ def load_events(product, index_code):
             # 参考价 P_ref = d_prev / y_prev（把金额/派息率口径换算回收益率）
             P_ref_ok = prev_i is not None and np.isfinite(d_arr[prev_i]) and d_arr[prev_i] > 0 \
                        and np.isfinite(y_arr[prev_i]) and y_arr[prev_i] > 0
-            y_fix = y_dfix = y_pfix = np.nan
+            y_fix = y_dfix = y_pfix = y_pqfix = np.nan
+            eps_target = np.nan
             if hist:
                 win = hist[-3:]
                 y3 = y_arr[win]; d3 = d_arr[win]; p3 = p_arr[win]
@@ -148,16 +213,30 @@ def load_events(product, index_code):
                 if len(p3v) >= 1 and np.nanmean(p3v) > 0 and P_ref_ok and prev_i is not None \
                    and np.isfinite(e_arr[prev_i]) and e_arr[prev_i] > 0:
                     y_pfix = float(np.nanmean(p3v) * e_arr[prev_i] * y_arr[prev_i] / d_arr[prev_i])  # 固定派息率
+                    # pq：派息率 × 季报外推 EPS（目标财年 = 本事件所属财年 + 1，即下一期分红依据的财年）
+                    try:
+                        target_year = int(g["report_year"].iloc[i]) + 1
+                    except Exception:
+                        target_year = None
+                    if target_year:
+                        eps_target = eps_est_asof(qrows, g["ann"].iloc[i], target_year)
+                    e_use = eps_target if np.isfinite(eps_target) and eps_target > 0 else e_arr[prev_i]
+                    if np.isfinite(e_use) and e_use > 0:
+                        y_pqfix = float(np.nanmean(p3v) * e_use * y_arr[prev_i] / d_arr[prev_i])
             col_y.append(y_fix if np.isfinite(y_fix) else v0)
             col_d.append(y_dfix if np.isfinite(y_dfix) else v0)
             col_p.append(y_pfix if np.isfinite(y_pfix) else v0)
+            col_pq.append(y_pqfix if np.isfinite(y_pqfix) else v0)
+            col_epsq.append(eps_target if np.isfinite(eps_target) else np.nan)
     ev["yield_true"] = ev["yield_dec"].fillna(ev["yield_dec"].groupby(ev["code"]).transform(
         lambda s: s.shift(1)))
     ev["yield_true"] = ev["yield_dec"]  # 真值列（NaN 行在覆盖率统计中自然处理）
     ev["y_pred_v0"] = col_v0       # 上年递推（对照）
     ev["y_fix_y"] = col_y          # 固定股息率
     ev["y_fix_d"] = col_d          # 固定分红
-    ev["y_fix_p"] = col_p          # 固定派息率
+    ev["y_fix_p"] = col_p          # 固定派息率（上年年报 EPS）
+    ev["y_fix_pq"] = col_pq        # 固定派息率 × 季报外推 EPS（TTM）
+    ev["eps_est_q"] = col_epsq     # 季报外推 EPS（诊断用）
     return ev
 
 def build_est_ex(ev):
@@ -214,7 +293,7 @@ def main(end_date=None, out_suffix=""):
         e_ex_f = np.array([np.nan if pd.isna(x) else (x.date() - dser0).days
                            for x in pd.to_datetime(ev["est_ex"])], dtype=float)
         Y_TRUE = ev["yield_true"].to_numpy(float)
-        YP = {k: ev[k].to_numpy(float) for k in ("y_pred_v0", "y_fix_y", "y_fix_d", "y_fix_p")}
+        YP = {k: ev[k].to_numpy(float) for k in ("y_pred_v0", "y_fix_y", "y_fix_d", "y_fix_p", "y_fix_pq")}
         order = np.argsort(e_ex_f, kind="stable")
         E_EX, E_ANN, E_CODE = e_ex_f[order], e_ann_f[order], ev_code_idx[order]
         YT = Y_TRUE[order]
@@ -247,7 +326,7 @@ def main(end_date=None, out_suffix=""):
                 T_rel = (T_day - dser0).days
                 sel_mask = (E_EX > tr) & (E_EX <= T_rel)
                 if not sel_mask.any():
-                    for k in ("y", "d", "p"):
+                    for k in ("y", "d", "p", "pq"):
                         recs.append(dict(date=dstr, product=prod, role=role, contract=sym,
                                          expire=T_day.isoformat(), spot=S, future=Fv,
                                          basis_raw=Fv - S, dpv_pts=0.0, basis_adj=Fv - S,
@@ -260,7 +339,7 @@ def main(end_date=None, out_suffix=""):
                 out_row_base = dict(date=dstr, product=prod, role=role, contract=sym,
                                     expire=T_day.isoformat(), spot=S, future=Fv,
                                     basis_raw=Fv - S)
-                for k, ycol in (("y", "y_fix_y"), ("d", "y_fix_d"), ("p", "y_fix_p")):
+                for k, ycol in (("y", "y_fix_y"), ("d", "y_fix_d"), ("p", "y_fix_p"), ("pq", "y_fix_pq")):
                     pred_part = np.nansum(w_by_event[pred_sel] * YPx[ycol][pred_sel] / 100.0)
                     tot = true_part + pred_part
                     dpv_pts = tot * S

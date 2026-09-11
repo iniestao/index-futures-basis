@@ -27,10 +27,14 @@ def main():
     ok &= run("fetch_dividends.py")
     # 5. 年报 EPS：最近两年报告期
     ok &= run("fetch_eps_annual.py")
+    # 5b. 季报 EPS（累计值 + 披露日）：pq 口径所需，历史只补缺失、最近2期刷新
+    ok &= run("fetch_eps_quarterly.py")
     # 6. 计算
     ok &= run("compute_adjusted_basis.py")
     ok &= run("compute_backtest.py")
     ok &= run("make_outputs.py")
+    # 7. 数据质量护栏（隐含股息率/覆盖率，告警不阻断）
+    run("check_data_quality.py")
     print("ALL DONE" if ok else "PARTIAL FAILURE", flush=True)
     sys.exit(0 if ok else 1)
 

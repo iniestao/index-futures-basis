@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""2025 样本外回测：三口径（固定股息率/固定分红/固定派息率）并列对比"""
+"""2025 样本外回测：四口径（固定股息率/固定分红/固定派息率/派息率×季报外推EPS）并列对比"""
 import os, sys, datetime as dt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import RAW, OUT, PRODUCTS, START, END, third_friday, env_setup
@@ -9,8 +9,9 @@ import numpy as np
 import pandas as pd
 
 FUT_CSV = os.path.join(RAW, "futures", "cffex_daily_all.csv")
-CALIBRES = ("y_fix_y", "y_fix_d", "y_fix_p")
-NAMES = {"y_fix_y": "固定股息率", "y_fix_d": "固定分红", "y_fix_p": "固定派息率"}
+CALIBRES = ("y_fix_y", "y_fix_d", "y_fix_p", "y_fix_pq")
+NAMES = {"y_fix_y": "固定股息率", "y_fix_d": "固定分红", "y_fix_p": "固定派息率",
+         "y_fix_pq": "派息率x季报EPS"}
 
 def main():
     fut = pd.read_csv(FUT_CSV, header=None,
