@@ -48,6 +48,23 @@ def main():
         out = out.dropna(subset=["weight_pct"])
         out.to_csv(os.path.join(RAW, "weights", f"{prod}_weights.csv"), index=False, encoding="utf-8-sig")
         print(f"[OK] {prod} {idx}: rows={len(out)}, weight_date={out['weight_date'].iloc[0]}, sum={out['weight_pct'].sum():.2f}")
+
+        # ---- 月末权重落库：把中证最新已发布月末数据按历史月度文件格式归档 ----
+        # closeweight.xls 为最近已发布月末权重（滞后约1个月）。若无该月末文件则落库，
+        # 使月度历史序列随时间自动滚动补全，避免历史权重断档。
+        wd = str(out["weight_date"].iloc[0]).replace("-", "")
+        arch = os.path.join(RAW, "weights", f"{idx}.SH_{wd}.csv")
+        if not os.path.exists(arch):
+            arch_df = pd.DataFrame({
+                "wind_code": [c + (".SH" if str(c).startswith("6") else ".SZ")
+                              for c in out["stock_code"]],
+                "i_weight": out["weight_pct"].to_numpy(),
+            })
+            arch_df.to_csv(arch, index=False, encoding="utf-8-sig")
+            print(f"[OK] archived monthly weights -> weights/{idx}.SH_{wd}.csv ({len(arch_df)} rows)")
+        else:
+            print(f"[skip] weights/{idx}.SH_{wd}.csv already exists")
+
         for _, r in out.iterrows():
             universe_rows.append((r["stock_code"], prod))
 
