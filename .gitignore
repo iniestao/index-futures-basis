@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .workbuddy/
+
+# 运行时失败日志
+data_raw/dividends/_*

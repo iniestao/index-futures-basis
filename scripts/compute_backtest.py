@@ -26,7 +26,7 @@ def main():
         sidx = sidx[(sidx["date"] >= "2024-06-01") & (sidx["date"] <= "2025-12-31")].reset_index(drop=True)
         dates = sidx["date"].tolist()
         closes = sidx["close"].to_numpy(float)
-        ev = build_est_ex(load_events(prod))
+        ev = build_est_ex(load_events(prod, cfg["index"]))
         dser0 = dt.date.fromisoformat(dates[0])
         e_ann = np.array([np.nan if pd.isna(x) else (x.date() - dser0).days for x in pd.to_datetime(ev["ann"])], float)
         e_ex = np.array([np.nan if pd.isna(x) else (x.date() - dser0).days for x in pd.to_datetime(ev["est_ex"])], float)

@@ -51,6 +51,18 @@ def main():
         for _, r in out.iterrows():
             universe_rows.append((r["stock_code"], prod))
 
+    # 历史月度权重文件（静态）的成分并集也纳入 universe：
+    # 历史成分（后被调出/退市前）的分红事件参与历史 DPV 计算，必须有分红数据
+    import glob as _glob
+    for fp in _glob.glob(os.path.join(RAW, "weights", "*.SH_*.csv")):
+        try:
+            hw = pd.read_csv(fp)
+            if "wind_code" in hw.columns:
+                for c in hw["wind_code"].astype(str).str[:6].unique():
+                    universe_rows.append((c, "hist"))
+        except Exception:
+            continue
+
     uni = pd.DataFrame(universe_rows, columns=["stock_code", "in_products"])
     uni_grouped = uni.groupby("stock_code")["in_products"].apply(lambda s: "|".join(sorted(s))).reset_index()
     uni_grouped.to_csv(os.path.join(RAW, "universe_all.csv"), index=False, encoding="utf-8-sig")

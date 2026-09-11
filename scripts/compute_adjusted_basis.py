@@ -80,10 +80,18 @@ def get_weight_vec(t_str, timeline, snapshot, codes):
     return np.array([snapshot.get(c, 0.0) for c in codes])
 
 # ---------- 事件表 ----------
-def load_events(product):
-    weights_df = pd.read_csv(os.path.join(RAW, "weights", f"{product}_weights.csv"),
-                             dtype={"stock_code": str})
-    members = set(weights_df["stock_code"])
+def load_events(product, index_code):
+    # 事件候选池 = 月度历史权重文件成分并集 ∪ 当前快照成分。
+    # 修复：原先只用当前快照 {product}_weights.csv，历史成分（后被调出的股票）
+    # 的分红事件被整体漏掉，导致历史 DPV 系统性低估、调整基差偏差。
+    # 注：已退市股票东财F10接口无分红数据（返回空），属数据源边界，无法免费补齐。
+    members = set()
+    for _, wmap in load_weight_timeline(index_code):
+        members |= set(wmap)
+    snap_fp = os.path.join(RAW, "weights", f"{product}_weights.csv")
+    if os.path.exists(snap_fp):
+        snap_df = pd.read_csv(snap_fp, dtype={"stock_code": str})
+        members |= set(snap_df["stock_code"])
     uni = pd.read_csv(os.path.join(RAW, "universe_all.csv"), dtype={"stock_code": str})
     rows = []
     for code in sorted(members & set(uni["stock_code"])):
@@ -192,7 +200,7 @@ def main(end_date=None, out_suffix=""):
         dates = sidx["date"].tolist()
         closes = sidx["close"].to_numpy(dtype=float)
 
-        ev = build_est_ex(load_events(prod))
+        ev = build_est_ex(load_events(prod, cfg["index"]))
         if len(ev) == 0:
             print(f"[WARN] no events for {prod}")
             continue
