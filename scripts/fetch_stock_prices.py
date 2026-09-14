@@ -28,6 +28,11 @@ TAIL_BARS = 45          # 增量窗口（约两个月交易日）
 WORKERS = int(os.environ.get("PRICE_WORKERS", "4"))   # 并发过高会触发新浪限流（曾整段失败）
 DELAY = float(os.environ.get("PRICE_DELAY", "0.1"))   # 每请求额外等待，压住突发速率
 FLUSH_EVERY = 400      # 每抓满 N 只即落盘（中断/超时不丢进度）
+# 抓取阶段的总时间预算（秒；0=不限）。这是**硬保护**：必须在 job 超时前主动收尾，
+# 否则 GitHub 会在 timeout-minutes 处直接 cancel 整个 job，连已抓数据都提交不了
+# （2026-09-14 即如此：退避遇上持续限流 → 跑满 90 分钟被取消，远端无任何产出）。
+# 预算用尽时停止取新任务、落盘已完成部分，剩余代码下次运行继续（无落库记录者天然进队列）。
+BUDGET = float(os.environ.get("PRICE_BUDGET", "3600"))
 
 # ---- 限流自适应退避 ----
 # 实测：新浪按「突发窗口」限流，被限时返回 456 或非 JSON 响应（也可能直接返回空）。
@@ -37,10 +42,17 @@ FLUSH_EVERY = 400      # 每抓满 N 只即落盘（中断/超时不丢进度）
 LIMIT_STATUS = (403, 429, 456, 500, 502, 503, 504)
 COOLDOWN_BASE = float(os.environ.get("PRICE_COOLDOWN", "15"))   # 首次冷却秒数
 COOLDOWN_MAX = float(os.environ.get("PRICE_COOLDOWN_MAX", "300"))
+# 冷却总预算：累计冷却超过此值说明限流是持续的，继续等只会烧掉 job 时间。
+# 此时停止抓取（剩余标记 rate_limited，下次运行重试），把 job 时间留给其他环节与提交。
+COOLDOWN_TOTAL_MAX = float(os.environ.get("PRICE_COOLDOWN_TOTAL", "900"))
 EMPTY_STREAK_TRIGGER = int(os.environ.get("PRICE_EMPTY_STREAK", "20"))  # 连续空到这个数即判定为被限流
 ATTEMPTS = int(os.environ.get("PRICE_ATTEMPTS", "4"))
+# 新浪被限流时每个失败代码都会走腾讯兜底，请求量会放大 2~3 倍、把限流拖得更久。
+# 给兜底设每轮次数上限，超限即视为本轮拿不到。
+TENCENT_MAX = int(os.environ.get("PRICE_TENCENT_MAX", "200"))
 
-_throttle = {"until": 0.0, "strikes": 0, "empty_streak": 0}
+_throttle = {"until": 0.0, "strikes": 0, "empty_streak": 0, "cooled": 0.0, "tencent": 0}
+_deadline = 0.0        # run() 开始时设定为 t0 + BUDGET
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -53,23 +65,43 @@ _print_lock = threading.Lock()
 
 
 def _wait_gate():
-    """在全局冷却结束前挂起本线程（限流时所有线程一起让路）"""
+    """在全局冷却结束前挂起本线程（限流时所有线程一起让路）；已超预算则立即返回"""
     while True:
+        if _over_budget():
+            return
         remain = _throttle["until"] - time.time()
         if remain <= 0:
             return
         time.sleep(min(5.0, remain))
 
 
+def _over_budget():
+    """本轮时间预算已用尽（或冷却总预算已耗尽）→ 停止取新任务"""
+    if _deadline and time.time() >= _deadline:
+        return True
+    return _throttle["cooled"] >= COOLDOWN_TOTAL_MAX > 0
+
+
 def _strike(reason):
-    """命中限流：拉长全局冷却（指数退避，上限 COOLDOWN_MAX），并重置空计数"""
+    """
+    命中限流：拉长全局冷却（指数退避，上限 COOLDOWN_MAX），并重置空计数。
+    注意两点防螺旋：
+      1) 冷却窗口内的重复命中不叠加 —— 4 个线程会同时撞上限流，
+         若各自 +=1 则 strikes 一次跳 4 级、冷却瞬间顶到 COOLDOWN_MAX，
+         之后每轮只放行几个请求，90 分钟也推进不了多少（2026-09-14 的实况）。
+      2) 累计冷却超过 COOLDOWN_TOTAL_MAX 即认定限流持续，由 _over_budget 收尾。
+    """
     with _print_lock:
+        now = time.time()
+        if now < _throttle["until"]:
+            return                                   # 已在冷却中：本次命中并入当前窗口
         _throttle["empty_streak"] = 0
         _throttle["strikes"] += 1
-        cd = min(COOLDOWN_MAX, COOLDOWN_BASE * (2 ** min(_throttle["strikes"] - 1, 4)))
-        _throttle["until"] = max(_throttle["until"], time.time() + cd)
+        cd = min(COOLDOWN_MAX, COOLDOWN_BASE * (2 ** min(_throttle["strikes"] - 1, 5)))
+        _throttle["until"] = max(_throttle["until"], now + cd)
+        _throttle["cooled"] += cd
         print(f"  [throttle] {reason} -> cool down {cd:.0f}s "
-              f"(strike {_throttle['strikes']})", flush=True)
+              f"(strike {_throttle['strikes']}, total {_throttle['cooled']:.0f}s)", flush=True)
 
 
 def _strike_ok():
@@ -193,10 +225,14 @@ def fetch_one(sess, code, n):
     sym = sina_symbol(code)
     if sym is None:
         return code, [], "empty"
+    if _over_budget():
+        return code, [], "skipped"
     url = SINA_URL.format(sym=sym, n=n)
     limited = False
     for att in range(ATTEMPTS):
         _wait_gate()
+        if _over_budget():
+            return code, [], "skipped"
         try:
             if DELAY:
                 time.sleep(DELAY)
@@ -228,11 +264,19 @@ def fetch_one(sess, code, n):
             _strike("non-JSON response")
         except Exception:
             time.sleep(1.0 + att)
-    # 兜底：腾讯
-    rows = fetch_tencent(sess, code)
-    if rows:
-        _strike_ok()
-        return code, rows, "ok"
+    # 兜底：腾讯。限流期新浪失败的代码会大量涌向这里，每只多 1~5 个请求，
+    # 会把请求量放大 2~3 倍、让限流拖得更久 —— 故设每轮次数上限。
+    use_tencent = False
+    if not _over_budget():
+        with _print_lock:
+            if _throttle["tencent"] < TENCENT_MAX:
+                _throttle["tencent"] += 1
+                use_tencent = True
+    if use_tencent:
+        rows = fetch_tencent(sess, code)
+        if rows:
+            _strike_ok()
+            return code, rows, "ok"
     if limited:
         return code, [], "rate_limited"
     # 两个源都无此代码（退市/未上市）：不落库，下次运行仍在「无存储记录」集合中被重试
@@ -281,6 +325,8 @@ def run(targets, tag):
     done = 0
     n_ok = 0
     t0 = time.time()
+    global _deadline
+    _deadline = t0 + BUDGET if BUDGET > 0 else 0.0
     stat_all = {}
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -305,6 +351,8 @@ def run(targets, tag):
             if rows:
                 ok_rows[code] = rows
                 n_ok += 1
+            elif reason == "skipped":
+                pass                     # 本轮时间预算用尽，未轮到：不算失败、不落清单，下次继续
             else:
                 # 空结果原先被 `elif rows:` 静默吞掉（既不计数也不落失败清单）—— 已修正
                 failed[code] = reason
@@ -312,11 +360,20 @@ def run(targets, tag):
                 flush()
                 print(f"[{tag}] {done}/{len(targets)} ok={n_ok} fail={len(failed)} "
                       f"{time.time() - t0:.0f}s", flush=True)
+            if _over_budget():
+                print(f"[{tag}] budget exhausted at {done}/{len(targets)} -> stop early "
+                      f"({time.time() - t0:.0f}s, cool={_throttle['cooled']:.0f}s)", flush=True)
+                break
     flush()
+    n_skip = len(targets) - done
     reasons = Counter(failed.values())
-    print(f"[{tag}] {len(targets)} targets -> ok={n_ok} fail={len(failed)} "
+    print(f"[{tag}] {len(targets)} targets -> ok={n_ok} fail={len(failed)} skipped={n_skip} "
           f"({dict(reasons)}) in {time.time() - t0:.0f}s | " +
           ", ".join(f"{y}:{r}x{c}" for y, (r, c) in sorted(stat_all.items())), flush=True)
+    if n_skip:
+        print(f"[{tag}] {n_skip} not fetched this round (budget) -> will retry next run; "
+              f"cooldown total {_throttle['cooled']:.0f}s, tencent fallbacks {_throttle['tencent']}",
+              flush=True)
     # 无论成功与否都写状态文件（全成功时清空上一轮遗漏的失败清单，避免陈旧记录误导）
     _write_status(tag, targets, n_ok, failed, reasons)
     return reasons
@@ -361,16 +418,26 @@ def main():
             daily = daily + extra
         if args.full:
             full = all_codes
-        # 顺序很关键：当前成分先抓。若再遇限流导致队列被截断，被牺牲的是历史成分
-        # （只影响历史回测精度），而不是今天算每日权重就需要的当前成分。
-        full = ([c for c in full if c in cur] + [c for c in full if c not in cur])
-        targets = [(c, FULL_BARS) for c in full] + [(c, TAIL_BARS) for c in daily]
+        # 顺序很关键。当前成分优先，且**当前成分的增量要排在历史成分回补之前** ——
+        # 若预算不足被截断，被牺牲的应是只影响历史回测的历史成分，而不是今天算每日权重
+        # 就需要的当前成分（否则当日权重漂移会停在上一日）。
+        #   ① 当前成分 × 无落库记录 → 补 3000 根，直接决定每日权重的覆盖率
+        #   ② 当前成分 × 已有记录   → 增量 45 根，保证当日价格不滞后
+        #   ③ 历史成分 × 无落库记录 → 回补历史精度，最后做
+        full_cur = [c for c in full if c in cur]
+        full_hist = [c for c in full if c not in cur]
+        targets = ([(c, FULL_BARS) for c in full_cur]
+                   + [(c, TAIL_BARS) for c in daily]
+                   + [(c, FULL_BARS) for c in full_hist])
     if args.limit:
         targets = targets[: args.limit]
 
+    n_full = sum(1 for _, n in targets if n == FULL_BARS)
+    n_tail = sum(1 for _, n in targets if n == TAIL_BARS)
+    est = (n_full * 1.6 + n_tail * 0.9) / max(WORKERS, 1)      # 无节流下的粗略耗时（秒）
     print(f"universe={len(all_codes)} stored={len(have)} current={len(cur)} "
-          f"-> full={sum(1 for _, n in targets if n == FULL_BARS)} "
-          f"tail={sum(1 for _, n in targets if n == TAIL_BARS)}", flush=True)
+          f"-> full={n_full} tail={n_tail} | workers={WORKERS} delay={DELAY}s "
+          f"budget={BUDGET:.0f}s est={est/60:.0f}min (throttle-free)", flush=True)
     run(targets, "prices")
     print("DONE", flush=True)
 
