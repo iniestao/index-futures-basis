@@ -73,5 +73,28 @@ def main():
     bt.to_csv(out_path, index=False, encoding="utf-8-sig")
     print("[OK] backtest rows:", len(bt), "->", out_path)
 
+    # MAE 汇总：**四个**口径 + pq 生效率。
+    # 原先 output/backtest_calibres_MAE.csv 自 init 提交后再没被任何脚本重写过，
+    # 只有三口径、数值与当前回测完全对不上，却最容易被当成"当前结论"来读。
+    mae = []
+    for prod, g in bt.groupby("product"):
+        rec = {"product": prod, "n_rows": len(g)}
+        for k in CALIBRES:
+            rec[NAMES[k] + "_MAE"] = round(float(g[NAMES[k] + "_err"].abs().mean()), 3)
+        d = (g[NAMES["y_fix_pq"] + "_pts"] - g[NAMES["y_fix_p"] + "_pts"]).abs()
+        # pq 与 p 完全相同的行 = 目标财年季报不可得而退化为上年年报 EPS 的行
+        rec["pq_生效比例"] = round(float((d > 1e-9).mean()), 3)
+        mae.append(rec)
+    mae_df = pd.DataFrame(mae)
+    mae_path = os.path.join(OUT, "backtest_calibres_MAE.csv")
+    mae_df.to_csv(mae_path, index=False, encoding="utf-8-sig")
+    print("[OK] calibre MAE ->", mae_path)
+    print(mae_df.to_string(index=False))
+    for _, r in mae_df.iterrows():
+        if r["pq_生效比例"] < 0.05:
+            print(f"  [WARN] {r['product']} 的 pq 仅 {r['pq_生效比例']*100:.0f}% 的行与 p 不同 —— "
+                  f"季报 EPS 覆盖不足时该口径会退化为上年年报 EPS，请结合 data_raw/eps_quarterly.csv "
+                  f"的报告期覆盖判断", flush=True)
+
 if __name__ == "__main__":
     main()

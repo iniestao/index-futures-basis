@@ -272,12 +272,15 @@ def load_events(product, index_code):
                    and np.isfinite(e_arr[prev_i]) and e_arr[prev_i] > 0:
                     y_pfix = float(np.nanmean(p3v) * e_arr[prev_i] * y_arr[prev_i] / d_arr[prev_i])  # 固定派息率
                     # pq：派息率 × 季报外推 EPS（目标财年 = 本事件所属财年 + 1，即下一期分红依据的财年）
-                    try:
-                        target_year = int(g["report_year"].iloc[i]) + 1
-                    except Exception:
-                        target_year = None
-                    if target_year:
-                        eps_target = eps_est_asof(qrows, g["ann"].iloc[i], target_year)
+                    # 事件所属财年由**公告日**推导：A 股年报分红在次年 1-6 月公告（属上一财年），
+                    # 7-12 月公告的多为中期/特别分红（属当年）。
+                    # 注意：早期版本这里读 ev 中并不存在的 report_year 列，KeyError 被
+                    # `except Exception` 静默吞掉 → target_year 恒为 None → eps_est_q 全为 NaN
+                    # → y_fix_pq 恒等于 y_fix_p，第 4 口径实际从未生效（2026-09-14 定位）。
+                    ann_i = pd.to_datetime(g["ann"].iloc[i], errors="coerce")
+                    if pd.notna(ann_i):
+                        ev_year = ann_i.year - 1 if ann_i.month <= 6 else ann_i.year
+                        eps_target = eps_est_asof(qrows, ann_i, ev_year + 1)
                     e_use = eps_target if np.isfinite(eps_target) and eps_target > 0 else e_arr[prev_i]
                     if np.isfinite(e_use) and e_use > 0:
                         y_pqfix = float(np.nanmean(p3v) * e_use * y_arr[prev_i] / d_arr[prev_i])

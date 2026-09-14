@@ -71,7 +71,7 @@ streamlit run app.py                 # 启动看板
 
 ## 数据质量
 
-每次运行产出 `output/data_quality_report.csv`（年度隐含股息率是否落在品种合理带内、分红/已公告覆盖率）与 `output/data_quality_structure.csv`（月末权重文件成分数与合计、个股价格面板覆盖率、**逐品种每日权重启用状态**）。个股日线抓取失败清单写入 `output/price_fetch_status_prices.csv`（随提交入库，便于核查新浪限流影响面；抓取脚本具备限流自适应冷却，并受单轮时间预算 `PRICE_BUDGET` 保护（本项目 4 小时，脚本默认 1 小时）——预算用尽即落盘已完成部分，剩余下次运行继续，避免撞上 job 上限被整体取消）。异常打印 Actions 注解并在看板「数据质量校验」中展示，不阻断流水线。详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md) 第 4 节。
+每次运行产出 `output/data_quality_report.csv`（年度隐含股息率是否落在品种合理带内、分红/已公告覆盖率）与 `output/data_quality_structure.csv`（月末权重文件成分数与合计、个股价格面板覆盖率、**最新交易日价格填充度**（与前一交易日对比，捕捉"当日增量被回补饿死"这类静默部分更新）、**逐品种每日权重启用状态**）。个股日线抓取失败清单写入 `output/price_fetch_status_prices.csv`（随提交入库，便于核查新浪限流影响面；抓取脚本按「当日增量 → 当前成分回补 → 历史成分回补」排序，具备限流自适应冷却，并受单轮时间预算 `PRICE_BUDGET` 保护（本项目 4 小时，脚本默认 1 小时）——预算用尽或冷却主导本轮即落盘已完成部分，剩余下次运行继续，避免撞上 job 上限被整体取消）。异常打印 Actions 注解并在看板「数据质量校验」中展示，不阻断流水线。详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md) 第 4 节。
 
 ## License
 

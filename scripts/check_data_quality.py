@@ -119,6 +119,42 @@ def structure_checks():
         rows.append(dict(item="个股价格面板", value=f"{len(codes & uni)}/{len(uni)} 只 ({cov*100:.1f}%)",
                          status=st, note=note))
 
+        # ---- 最新交易日的填充度：当日增量是否真的跑完 ----
+        # 只检查「面板里有没有这只票」不够：当日增量若被昂贵的全量回补饿死（2026-09-14 实况：
+        # 回补 446 只后中止，当日增量 1839 只一只没跑），面板仍在、覆盖率仍好看，
+        # 但最新一天只有少数代码有价 —— 当日权重会静默退化为 forward fill 的上一日价格。
+        # 故与**前一交易日**对比：两者应基本持平，骤降说明当日增量没跑完。
+        cur_all = set()
+        for prod in PRODUCTS:
+            fp = os.path.join(RAW, "weights", f"{prod}_weights.csv")
+            if os.path.exists(fp):
+                try:
+                    cur_all |= set(pd.read_csv(fp, dtype={"stock_code": str})["stock_code"])
+                except Exception:
+                    continue
+        if cur_all:
+            try:
+                dfp = pd.read_csv(pfiles[-1], dtype={0: str})
+                dfp = dfp.set_index(dfp.columns[0])
+                cols = [c for c in dfp.columns if c in cur_all]
+                if len(dfp) >= 2 and cols:
+                    d_last = str(dfp.index[-1])
+                    d_prev = str(dfp.index[-2])
+                    n_last = int(dfp.iloc[-1][cols].notna().sum())
+                    n_prev = int(dfp.iloc[-2][cols].notna().sum())
+                    r = n_last / max(n_prev, 1)
+                    st2 = "OK" if r >= 0.9 else "WARN"
+                    n2 = (f"{d_last} 有价 {n_last}/{len(cols)} 只，前一交易日({d_prev}) {n_prev} 只 "
+                          f"({r*100:.0f}%)")
+                    if st2 == "WARN":
+                        n2 += "；当日增量未跑完 → 当日权重会退化为上一日价格，可再跑一次补齐"
+                        warns.append(f"最新交易日价格覆盖骤降（{n_last}/{n_prev}），当日增量可能被截断")
+                    rows.append(dict(item="最新交易日价格填充（当前成分）", value=n2.split("；")[0],
+                                     status=st2, note=n2))
+            except Exception as e:
+                rows.append(dict(item="最新交易日价格填充（当前成分）", value="检查失败",
+                                 status="WARN", note=f"{type(e).__name__}: {e}"))
+
         # ---- 每品种：每日权重是否真正生效（这是最该看的指标）----
         # 判据用**权重覆盖率**：缺的可能是权重很大的成分（2026-09-13 云端即如此，
         # IC 按只数 61% 过线、按权重却缺 40.7/100，输出的只是半更新权重）。

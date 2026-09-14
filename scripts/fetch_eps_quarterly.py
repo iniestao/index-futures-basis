@@ -89,28 +89,46 @@ def main():
     todo = [q for q in cols if q.isoformat() not in have or q.isoformat() in refresh]
     print(f"季度总数={len(cols)} 待抓={len(todo)} (刷新最近{REFRESH_LAST_N}期 + 缺失期)", flush=True)
 
-    frames = [old]
+    n_old = len(old)
+    frames = []                    # 本轮成功抓取（非空）的帧，将替换同报告期的旧行
+    replace = set()                # 需要被替换掉的报告期
     ok = fail = 0
     for q in todo:
         df = fetch_quarter(q, uni)
         if df is None:
             fail += 1
             continue
-        # 该报告期已有数据 → 用新结果替换（公告日期会滚动更新）
-        frames = [f for f in frames if not (len(f) and (f["report_date"] == q.isoformat()).any())]
+        if len(df) == 0:
+            # 空结果（接口无该期数据/被限流）：**保留旧行**，本轮不计入替换。
+            # 早期版本把空帧也当成一次成功并写入，等于把该期已有数据抹掉。
+            ok += 1
+            print(f"  [EMPTY] {q} 无数据，保留既有记录", flush=True)
+            time.sleep(1.0)
+            continue
+        # 该报告期已有数据 → 只替换**该期的行**（不是整个 DataFrame）
         frames.append(df)
+        replace.add(q.isoformat())
         ok += 1
         print(f"  [OK] {q} rows={len(df)}", flush=True)
         time.sleep(1.0)
 
-    if ok == 0:
-        print("no new quarter fetched; file unchanged")
-    merged = pd.concat(frames, ignore_index=True)
+    if n_old:
+        old = old[~old["report_date"].isin(replace)]
+    merged = pd.concat([old] + frames, ignore_index=True)
     merged = merged.drop_duplicates(subset=["stock_code", "report_date"], keep="last")
     merged = merged.sort_values(["stock_code", "report_date"]).reset_index(drop=True)
+
+    # 数据量护栏：本轮只应替换个别报告期，行数不应显著下降。若下降则拒绝写盘。
+    # （历史事故：按报告期"替换"时用整帧丢弃的写法，把 138k 行压成 6.5k 行。）
+    if n_old and len(merged) < n_old * 0.9:
+        print(f"[FATAL] 拒绝写盘：行数 {n_old} -> {len(merged)} 大幅下降，"
+              f"疑似按报告期替换时误删历史。请检查 replace 集合={sorted(replace)[:8]}", flush=True)
+        sys.exit(1)
+
     merged.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"[DONE] eps_quarterly rows={len(merged)} quarters={merged['report_date'].nunique()} "
-          f"codes={merged['stock_code'].nunique()} (fetched={ok}, failed={fail})", flush=True)
+    print(f"[DONE] eps_quarterly rows={n_old}->{len(merged)} "
+          f"quarters={merged['report_date'].nunique()} codes={merged['stock_code'].nunique()} "
+          f"(fetched={ok}, failed={fail})", flush=True)
 
 
 if __name__ == "__main__":

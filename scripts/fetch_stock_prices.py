@@ -42,9 +42,12 @@ BUDGET = float(os.environ.get("PRICE_BUDGET", "3600"))
 LIMIT_STATUS = (403, 429, 456, 500, 502, 503, 504)
 COOLDOWN_BASE = float(os.environ.get("PRICE_COOLDOWN", "15"))   # 首次冷却秒数
 COOLDOWN_MAX = float(os.environ.get("PRICE_COOLDOWN_MAX", "300"))
-# 冷却总预算：累计冷却超过此值说明限流是持续的，继续等只会烧掉 job 时间。
-# 此时停止抓取（剩余标记 rate_limited，下次运行重试），把 job 时间留给其他环节与提交。
-COOLDOWN_TOTAL_MAX = float(os.environ.get("PRICE_COOLDOWN_TOTAL", "900"))
+# 冷却总预算（下限）。**判据是"冷却主导本轮"而不是冷却的绝对值**：真螺旋的特征是
+# 绝大部分时间在睡觉；而限流下仍在稳定推进的长任务，冷却累计到几千秒也属正常。
+# 早期版本只看 cooled ≥ 900s，把后者也砍了 —— 2026-09-14 首次回补即如此：
+# 446/2922 只后中止，队列后段的「当日增量」完全没跑，当日价格大面积为空。
+COOLDOWN_TOTAL_MIN = float(os.environ.get("PRICE_COOLDOWN_TOTAL", "900"))
+COOLDOWN_DOMINANCE = float(os.environ.get("PRICE_COOLDOWN_DOMINANCE", "0.6"))
 EMPTY_STREAK_TRIGGER = int(os.environ.get("PRICE_EMPTY_STREAK", "20"))  # 连续空到这个数即判定为被限流
 ATTEMPTS = int(os.environ.get("PRICE_ATTEMPTS", "4"))
 # 新浪被限流时每个失败代码都会走腾讯兜底，请求量会放大 2~3 倍、把限流拖得更久。
@@ -53,6 +56,7 @@ TENCENT_MAX = int(os.environ.get("PRICE_TENCENT_MAX", "200"))
 
 _throttle = {"until": 0.0, "strikes": 0, "empty_streak": 0, "cooled": 0.0, "tencent": 0}
 _deadline = 0.0        # run() 开始时设定为 t0 + BUDGET
+_run_t0 = 0.0          # 本轮开始时刻（用于判断"冷却是否主导本轮"）
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -76,10 +80,20 @@ def _wait_gate():
 
 
 def _over_budget():
-    """本轮时间预算已用尽（或冷却总预算已耗尽）→ 停止取新任务"""
-    if _deadline and time.time() >= _deadline:
+    """
+    本轮是否该收尾？
+      1) 时间预算用尽 → 必须在 job 超时前主动收尾（否则连已抓数据都提交不了）；
+      2) 冷却**主导**本轮 → 认定限流持续，继续等只是在烧 job 时间。
+    判据 2 用「冷却占已用时长的比例」而不是冷却秒数的绝对值：限流下仍在稳定推进的
+    长任务（如首次全量回补）累计冷却到几千秒仍属正常，不该被砍掉。
+    """
+    now = time.time()
+    if _deadline and now >= _deadline:
         return True
-    return _throttle["cooled"] >= COOLDOWN_TOTAL_MAX > 0
+    if COOLDOWN_TOTAL_MIN > 0 and _throttle["cooled"] >= COOLDOWN_TOTAL_MIN:
+        elapsed = now - _run_t0
+        return elapsed <= 0 or _throttle["cooled"] >= COOLDOWN_DOMINANCE * elapsed
+    return False
 
 
 def _strike(reason):
@@ -89,7 +103,9 @@ def _strike(reason):
       1) 冷却窗口内的重复命中不叠加 —— 4 个线程会同时撞上限流，
          若各自 +=1 则 strikes 一次跳 4 级、冷却瞬间顶到 COOLDOWN_MAX，
          之后每轮只放行几个请求，90 分钟也推进不了多少（2026-09-14 的实况）。
-      2) 累计冷却超过 COOLDOWN_TOTAL_MAX 即认定限流持续，由 _over_budget 收尾。
+      2) 累计冷却**主导**本轮（cooled ≥ COOLDOWN_DOMINANCE × 已用时长）即认定限流持续，
+         由 _over_budget 收尾。注意不是"冷却秒数超过某个绝对值"就收尾 —— 那样会把
+         限流下仍稳定推进的长任务也砍掉（见 _over_budget 注释）。
     """
     with _print_lock:
         now = time.time()
@@ -325,7 +341,8 @@ def run(targets, tag):
     done = 0
     n_ok = 0
     t0 = time.time()
-    global _deadline
+    global _deadline, _run_t0
+    _run_t0 = t0
     _deadline = t0 + BUDGET if BUDGET > 0 else 0.0
     stat_all = {}
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -361,8 +378,10 @@ def run(targets, tag):
                 print(f"[{tag}] {done}/{len(targets)} ok={n_ok} fail={len(failed)} "
                       f"{time.time() - t0:.0f}s", flush=True)
             if _over_budget():
-                print(f"[{tag}] budget exhausted at {done}/{len(targets)} -> stop early "
-                      f"({time.time() - t0:.0f}s, cool={_throttle['cooled']:.0f}s)", flush=True)
+                el = time.time() - t0
+                print(f"[{tag}] stop early at {done}/{len(targets)} "
+                      f"({el:.0f}s elapsed, cooled={_throttle['cooled']:.0f}s "
+                      f"= {_throttle['cooled']/max(el,1)*100:.0f}% of elapsed)", flush=True)
                 break
     flush()
     n_skip = len(targets) - done
@@ -418,16 +437,17 @@ def main():
             daily = daily + extra
         if args.full:
             full = all_codes
-        # 顺序很关键。当前成分优先，且**当前成分的增量要排在历史成分回补之前** ——
-        # 若预算不足被截断，被牺牲的应是只影响历史回测的历史成分，而不是今天算每日权重
-        # 就需要的当前成分（否则当日权重漂移会停在上一日）。
-        #   ① 当前成分 × 无落库记录 → 补 3000 根，直接决定每日权重的覆盖率
-        #   ② 当前成分 × 已有记录   → 增量 45 根，保证当日价格不滞后
-        #   ③ 历史成分 × 无落库记录 → 回补历史精度，最后做
+        # 顺序很关键，按「对当日产品的价值 / 抓取成本」排序：
+        #   ② 当前成分 × 已有记录 → 增量 45 根：最便宜（1 请求/只），保证"今天"的价格不缺。
+        #      必须排在回补之前 —— 回补是 3000 根/只 的昂贵操作，一旦预算被它耗尽，
+        #      当日价格就会整体滞后一日（2026-09-14 实况：回补吃掉全部时间，
+        #      2294 只里只有 446 只有当日价，当日增量一只没跑）。
+        #   ① 当前成分 × 无落库记录 → 补 3000 根：决定每日权重的覆盖率，其次做。
+        #   ③ 历史成分 × 无落库记录 → 回补历史精度，最后做（其权重多为 0）。
         full_cur = [c for c in full if c in cur]
         full_hist = [c for c in full if c not in cur]
-        targets = ([(c, FULL_BARS) for c in full_cur]
-                   + [(c, TAIL_BARS) for c in daily]
+        targets = ([(c, TAIL_BARS) for c in daily]
+                   + [(c, FULL_BARS) for c in full_cur]
                    + [(c, FULL_BARS) for c in full_hist])
     if args.limit:
         targets = targets[: args.limit]
