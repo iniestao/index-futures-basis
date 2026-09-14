@@ -15,9 +15,11 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    # 抓取阶段自带硬时间预算（PRICE_BUDGET，见下），会在预算内主动收尾并落盘已抓数据；
-    # 本上限是兜底，防止其他环节异常时无限占用。首次全量回补约需多轮，日常增量仅数分钟。
-    timeout-minutes: 120
+    # 上限依据：GitHub-hosted runner 单 job 硬上限 **6 小时（360 分钟）**，超过即被终止，
+    # 该上限与仓库可见性无关（public/private 相同）。本仓库为 public 仓库，Actions 分钟数
+    # 免费且不限量，故无需为节省额度压缩时长 —— 设为 5 小时，给 6 小时硬上限留 1 小时余量。
+    # 抓取阶段另有 PRICE_BUDGET 主动收尾（见下），日常增量运行仅数分钟，用不到本上限。
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
 
@@ -39,9 +41,11 @@ jobs:
           PRICE_WORKERS: "4"
           PRICE_DELAY: "0.1"
           # 抓取总时间预算（秒）。用尽即停止取新任务并落盘已完成部分，剩余下次运行继续 ——
-          # 2026-09-14 曾因退避遇到持续限流而跑满 90 分钟被 GitHub cancel，远端零产出。
-          # 不要把它设得接近 timeout-minutes，其他环节（面板/回测/图表/Excel）还需时间。
-          PRICE_BUDGET: "3600"
+          # 2026-09-14 曾因退避遇上持续限流而跑满当时的 timeout-minutes(90) 被 GitHub cancel，
+          # 远端零产出（连已抓数据都提交不了）。
+          # 设 4 小时：public 仓库分钟免费，放宽后即使限流严重也能一轮抓完全部 3.5k 只
+          # （无限流时全量仅约 11 分钟）。必须显著小于 timeout-minutes，其他环节还需时间。
+          PRICE_BUDGET: "14400"
         run: python scripts/run_daily.py
 
       - name: Commit updated data
