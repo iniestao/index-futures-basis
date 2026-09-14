@@ -3,6 +3,9 @@ __pycache__/
 .DS_Store
 .workbuddy/
 
+# 本地临时/调试脚本与诊断数据（不入库：内含本机环境信息，且体积大）
+working/
+
 # 运行时失败日志
 data_raw/dividends/_*
 

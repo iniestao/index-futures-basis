@@ -31,6 +31,11 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
 
       - name: Run daily pipeline
+        env:
+          # 个股日线抓取：并发过高会被新浪按突发窗口限流（2026-09-13 曾致整段队列失败），
+          # 故降并发 + 留间隔；脚本内另有限流自适应冷却（连续空响应 → 全局退避）。
+          PRICE_WORKERS: "4"
+          PRICE_DELAY: "0.1"
         run: python scripts/run_daily.py
 
       - name: Commit updated data

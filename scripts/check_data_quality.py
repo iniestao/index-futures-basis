@@ -55,7 +55,8 @@ def div_file_coverage(product, index_code):
 
 
 EXPECT_N = INDEX_MEMBERS
-MIN_PRICE_COV = 0.5     # 每日权重生效所需的价格覆盖率下限（与 weight_daily 保持一致）
+MIN_PRICE_COV = 0.3     # 价格计数覆盖率灾难性下限（与 weight_daily.MIN_PRICE_COV 一致）
+MIN_W_COV = 0.9         # 每日权重生效所需的**权重**覆盖率下限（与 weight_daily.MIN_W_COV 一致）
 
 
 def structure_checks():
@@ -112,12 +113,47 @@ def structure_checks():
         uni = set(pd.read_csv(uni_fp, dtype={"stock_code": str})["stock_code"]) if os.path.exists(uni_fp) else set()
         cov = len(codes & uni) / len(uni) if uni else np.nan
         st = "OK" if np.isfinite(cov) and cov >= MIN_PRICE_COV else "WARN"
-        note = f"最新交易日 {last}"
+        note = f"最新交易日 {last}；计数覆盖率（含已退市历史成分，后者天然抓不到，故不可能到 100%）"
         if st == "WARN":
-            note += f"；覆盖率 <{MIN_PRICE_COV*100:.0f}% → 未覆盖个股漂移记 1.0（权重不动），日内权重为部分更新"
-            warns.append(f"个股价格覆盖 {cov*100:.1f}% 低于阈值")
+            warns.append(f"个股价格覆盖 {cov*100:.1f}% 低于下限 {MIN_PRICE_COV*100:.0f}%")
         rows.append(dict(item="个股价格面板", value=f"{len(codes & uni)}/{len(uni)} 只 ({cov*100:.1f}%)",
                          status=st, note=note))
+
+        # ---- 每品种：每日权重是否真正生效（这是最该看的指标）----
+        # 判据用**权重覆盖率**：缺的可能是权重很大的成分（2026-09-13 云端即如此，
+        # IC 按只数 61% 过线、按权重却缺 40.7/100，输出的只是半更新权重）。
+        rows.append(dict(item="每日权重启用状态", value="", status="", note="按品种分别判定（权重覆盖率为准）"))
+        for prod in PRODUCTS:
+            snap_fp = os.path.join(RAW, "weights", f"{prod}_weights.csv")
+            if not os.path.exists(snap_fp):
+                continue
+            snap = pd.read_csv(snap_fp, dtype={"stock_code": str, "index_code": str})
+            if "weight_pct" not in snap.columns:
+                continue
+            snap["_w"] = pd.to_numeric(snap["weight_pct"], errors="coerce")
+            snap = snap.dropna(subset=["_w"])
+            idx = str(snap["index_code"].iloc[0]) if "index_code" in snap.columns else ""
+            axis = set(snap["stock_code"])
+            for fp in glob.glob(os.path.join(RAW, "weights", f"{idx}.SH_*.csv")):
+                try:
+                    d = pd.read_csv(fp, dtype=str)
+                    col = "wind_code" if "wind_code" in d.columns else d.columns[0]
+                    axis |= {str(x).split(".")[0] for x in d[col].dropna()}
+                except Exception:
+                    continue
+            n_axis = len(axis)
+            cnt_cov = len(axis & codes) / n_axis if n_axis else np.nan
+            tot_w = float(snap["_w"].sum())
+            w_cov = float(snap.loc[snap["stock_code"].isin(codes), "_w"].sum() / tot_w) if tot_w else np.nan
+            ok = np.isfinite(w_cov) and w_cov >= MIN_W_COV and np.isfinite(cnt_cov) and cnt_cov >= MIN_PRICE_COV
+            miss_w = tot_w - float(snap.loc[snap["stock_code"].isin(codes), "_w"].sum())
+            rows.append(dict(
+                item=f"  {prod} {idx}",
+                value=f"权重覆盖 {w_cov*100:.1f}% / 计数覆盖 {cnt_cov*100:.1f}%（缺 {miss_w:.1f}/100 权重）",
+                status="OK（每日权重生效）" if ok else "WARN（回退月末静态权重）",
+                note=f"axis={n_axis}，阈值 权重≥{MIN_W_COV*100:.0f}% 且计数≥{MIN_PRICE_COV*100:.0f}%"))
+            if not ok:
+                warns.append(f"{prod} 每日权重未生效：权重覆盖 {w_cov*100:.1f}% < {MIN_W_COV*100:.0f}%")
     return pd.DataFrame(rows), warns
 
 

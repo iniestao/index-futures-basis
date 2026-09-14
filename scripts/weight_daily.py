@@ -11,6 +11,10 @@
 其中 A = ≤t 最近的中证月末权重日，FFMC = 自由流通市值。
 归一化分母含**全部成分股**（而非仅事件股票），保证单位与官方文件一致（百分点）。
 
+启用判据：以**权重覆盖率**为准（有价格数据的成分股权重 / 锚点总权重，逐日中位数
+≥ MIN_W_COV，默认 0.9），不足则整体回退月末静态权重。不用「只数占比」当主判据 ——
+后者会放过「缺的都是权重很大的成分」这种情形，产出半更新的伪每日权重。
+
 为什么锚定而不是直接按流通市值重算：中证权重 = Σ(自由流通市值 × 加权比例因子)，
 因子按分级靠档（≤15%→15%…100%）且仅在定期调整时更新；把官方权重当锚点，
 因子差异被锚点吸收，本模块只需刻画**期内相对变动**，精度显著高于纯自算。
@@ -141,10 +145,16 @@ def daily_weight_matrix(dates, timeline, snapshot, extra_codes):
     px = px.reindex(columns=axis)
     # 注意：不得剔除"无价格数据"的成分股 —— 它们必须留在归一化分母里（漂移记 1.0，
     # 等价于权重不动）。若剔除，剩余个股权重会被整体放大，反而引入系统性偏差。
-    cov = float(px.notna().any(axis=0).mean())
-    min_cov = float(os.environ.get("MIN_PRICE_COV", "0.5"))
-    if cov < min_cov:
-        print(f"  [WARN] price coverage {cov*100:.1f}% < {min_cov*100:.0f}%; skip daily weights", flush=True)
+    #
+    # 判据说明（2026-09-14 修正）：原先只用「有价格的成分股**只数**占比」当门槛，
+    # 该指标用「全部历史成分」作分母，会放过"缺的都是小票"或误杀"缺的权重很大"两种情形。
+    # 实测反例：IC 计数覆盖 61%（过线）、但按权重算缺 40.7/100 —— 40% 的指数权重其实
+    # 被冻结在月末锚点，输出的并非真正的每日权重。故改为以**权重覆盖率**为主判据。
+    cov_cnt = float(px.notna().any(axis=0).mean())
+    min_cnt = float(os.environ.get("MIN_PRICE_COV", "0.3"))     # 只作为灾难性下限
+    if cov_cnt < min_cnt:
+        print(f"  [WARN] price count coverage {cov_cnt*100:.1f}% < {min_cnt*100:.0f}%; "
+              f"skip daily weights", flush=True)
         return None, None
 
     adj = apply_share_events(px, dates, load_share_events(axis))
@@ -153,6 +163,7 @@ def daily_weight_matrix(dates, timeline, snapshot, extra_codes):
 
     n_d, n_a = A.shape
     W = np.zeros((n_d, n_a), dtype="float32")
+    cov_w = np.ones(n_d, dtype="float64")      # 每交易日：有价格数据的成分股权重占锚点权重之比
     dts = np.array(dates)
 
     # 每个交易日 -> 锚点（≤t 最近的中证月末文件；t 早于最早文件时用最早一期，但基准价取 t 当日，避免前视）
@@ -180,10 +191,24 @@ def daily_weight_matrix(dates, timeline, snapshot, extra_codes):
             base_pos = min(pos, i) if pos >= 0 else i     # 锚点晚于 t 时用当日价 → 漂移为 0（无前视）
             base = A[base_pos]
             cur = A[i]
-            ratio = np.where(np.isfinite(cur) & np.isfinite(base), cur / base, 1.0)
+            ok = np.isfinite(cur) & np.isfinite(base) & (base > 0)
+            # A 已把无效值置 nan 且保证 base>0（A<=0 被屏蔽），故 cur/base 不会除零
+            ratio = np.where(ok, cur / base, 1.0)
             ratio = np.where(np.isfinite(ratio) & (ratio > 0), ratio, 1.0)
             num = np.where(w0 > 0, w0 * ratio, 0.0)
             s = num.sum()
             if s > 0:
                 W[i] = (num / s * w0.sum()).astype("float32")
+                cov_w[i] = float((w0 * ok).sum() / w0.sum())
+
+    med_w = float(np.median(cov_w))
+    min_w = float(os.environ.get("MIN_W_COV", "0.9"))
+    if med_w < min_w:
+        print(f"  [WARN] weight coverage median {med_w*100:.1f}% < {min_w*100:.0f}% "
+              f"(count coverage {cov_cnt*100:.1f}%); 回退月末静态权重 —— "
+              f"权重覆盖率不足时，未被覆盖的成分股权重会被冻结在锚点，"
+              f"输出的并非真正的每日权重", flush=True)
+        return None, None
+    print(f"  [daily weights] axis={len(axis)} count_cov={cov_cnt*100:.1f}% "
+          f"weight_cov median={med_w*100:.1f}% min={cov_w.min()*100:.1f}%", flush=True)
     return W, axis

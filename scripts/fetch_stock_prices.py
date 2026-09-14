@@ -25,9 +25,22 @@ PRICE_DIR = os.path.join(RAW, "stock_prices")
 W_DIR = os.path.join(RAW, "weights")
 FULL_BARS = 3000        # 全量回溯（覆盖 2014 年至今）
 TAIL_BARS = 45          # 增量窗口（约两个月交易日）
-WORKERS = int(os.environ.get("PRICE_WORKERS", "8"))
-DELAY = float(os.environ.get("PRICE_DELAY", "0"))   # 每请求额外等待（本地代理限流时调大）
+WORKERS = int(os.environ.get("PRICE_WORKERS", "4"))   # 并发过高会触发新浪限流（曾整段失败）
+DELAY = float(os.environ.get("PRICE_DELAY", "0.1"))   # 每请求额外等待，压住突发速率
 FLUSH_EVERY = 400      # 每抓满 N 只即落盘（中断/超时不丢进度）
+
+# ---- 限流自适应退避 ----
+# 实测：新浪按「突发窗口」限流，被限时返回 456 或非 JSON 响应（也可能直接返回空）。
+# 若不退避而是继续猛打，限流窗口会持续吞掉整段队列（2026-09-13 云端运行即如此：
+# 000 段与 600 段成功，中间的 001/002/003/300/301 整段失败，共丢 1624 只）。
+# 策略：连续空/被限 → 全局冷却（指数增长，成功即重置），而不是各线程独立重试。
+LIMIT_STATUS = (403, 429, 456, 500, 502, 503, 504)
+COOLDOWN_BASE = float(os.environ.get("PRICE_COOLDOWN", "15"))   # 首次冷却秒数
+COOLDOWN_MAX = float(os.environ.get("PRICE_COOLDOWN_MAX", "300"))
+EMPTY_STREAK_TRIGGER = int(os.environ.get("PRICE_EMPTY_STREAK", "20"))  # 连续空到这个数即判定为被限流
+ATTEMPTS = int(os.environ.get("PRICE_ATTEMPTS", "4"))
+
+_throttle = {"until": 0.0, "strikes": 0, "empty_streak": 0}
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -37,6 +50,43 @@ SINA_URL = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
             "CN_MarketData.getKLineData?symbol={sym}&scale=240&ma=no&datalen={n}")
 
 _print_lock = threading.Lock()
+
+
+def _wait_gate():
+    """在全局冷却结束前挂起本线程（限流时所有线程一起让路）"""
+    while True:
+        remain = _throttle["until"] - time.time()
+        if remain <= 0:
+            return
+        time.sleep(min(5.0, remain))
+
+
+def _strike(reason):
+    """命中限流：拉长全局冷却（指数退避，上限 COOLDOWN_MAX），并重置空计数"""
+    with _print_lock:
+        _throttle["empty_streak"] = 0
+        _throttle["strikes"] += 1
+        cd = min(COOLDOWN_MAX, COOLDOWN_BASE * (2 ** min(_throttle["strikes"] - 1, 4)))
+        _throttle["until"] = max(_throttle["until"], time.time() + cd)
+        print(f"  [throttle] {reason} -> cool down {cd:.0f}s "
+              f"(strike {_throttle['strikes']})", flush=True)
+
+
+def _strike_ok():
+    """成功一次即认为限流已解除，冷却计数归零"""
+    with _print_lock:
+        if _throttle["strikes"] or _throttle["empty_streak"]:
+            _throttle["strikes"] = 0
+            _throttle["empty_streak"] = 0
+
+
+def _note_empty():
+    """空响应可能只是「该股无行情」，但连续大量空说明是被限流 —— 触发冷却"""
+    with _print_lock:
+        _throttle["empty_streak"] += 1
+        hit = _throttle["empty_streak"] >= EMPTY_STREAK_TRIGGER
+    if hit:
+        _strike(f"{EMPTY_STREAK_TRIGGER} consecutive empty responses")
 
 
 def sina_symbol(code):
@@ -134,16 +184,27 @@ def fetch_tencent(sess, code, start_date="2015-01-01", batches=5):
 
 
 def fetch_one(sess, code, n):
-    """返回 (code, [(day, close)]) ；失败返回 (code, None)。新浪为主、腾讯兜底"""
+    """
+    返回 (code, rows, reason)：
+      rows   = [(day, close)]，失败为空列表
+      reason = ok / empty（两源都无此代码，多为退市）/ rate_limited / error
+    新浪为主、腾讯兜底。命中限流时触发全局冷却，避免持续猛打。
+    """
     sym = sina_symbol(code)
     if sym is None:
-        return code, []
+        return code, [], "empty"
     url = SINA_URL.format(sym=sym, n=n)
-    for att in range(3):
+    limited = False
+    for att in range(ATTEMPTS):
+        _wait_gate()
         try:
             if DELAY:
                 time.sleep(DELAY)
             r = sess.get(url, headers=UA, timeout=20)
+            if r.status_code in LIMIT_STATUS:
+                limited = True
+                _strike(f"sina HTTP {r.status_code}")
+                continue
             txt = (r.text or "").strip()
             if not txt or txt in ("null", "[]", "null;"):
                 break
@@ -158,17 +219,25 @@ def fetch_one(sess, code, n):
                 except Exception:
                     continue
             if out:
-                return code, out
+                _strike_ok()
+                return code, out, "ok"
             break
+        except json.JSONDecodeError:
+            # 返回了非 JSON（限流页/HTML 错误页）
+            limited = True
+            _strike("non-JSON response")
         except Exception:
             time.sleep(1.0 + att)
     # 兜底：腾讯
     rows = fetch_tencent(sess, code)
     if rows:
-        return code, rows
-    # 两个源都无数据（退市/新股未上市/源不可达）：返回空 —— 该代码不会落库，
-    # 下次运行仍在「无存储记录」集合中被重试，天然自愈；整体覆盖情况由质量护栏报告
-    return code, []
+        _strike_ok()
+        return code, rows, "ok"
+    if limited:
+        return code, [], "rate_limited"
+    # 两个源都无此代码（退市/未上市）：不落库，下次运行仍在「无存储记录」集合中被重试
+    _note_empty()
+    return code, [], "empty"
 
 
 def upsert(new_by_code):
@@ -198,13 +267,19 @@ def upsert(new_by_code):
 
 
 def run(targets, tag):
-    """targets: list[(code, bars)]；分批落盘，中断也不丢已抓数据"""
+    """
+    targets: list[(code, bars)]；分批落盘，中断也不丢已抓数据。
+    返回 Counter({reason: n})，并写出**入库的**状态文件（原先的 _failed.txt 被 .gitignore
+    排除，云端失败原因完全不可见；改写到 output/ 下随数据一起提交）。
+    """
+    from collections import Counter
     if not targets:
         print(f"[{tag}] nothing to fetch", flush=True)
-        return 0, 0
+        return Counter()
     sess = requests.Session()
-    ok_rows, failed = {}, []
+    ok_rows, failed = {}, {}
     done = 0
+    n_ok = 0
     t0 = time.time()
     stat_all = {}
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -221,25 +296,46 @@ def run(targets, tag):
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         futs = {ex.submit(fetch_one, sess, c, n): c for c, n in targets}
         for fu in as_completed(futs):
-            code, rows = fu.result()
+            try:
+                code, rows, reason = fu.result()
+            except Exception as e:                     # 编程错误必须可见，不得静默丢
+                code = futs[fu]
+                rows, reason = [], f"error:{type(e).__name__}"
             done += 1
-            if rows is None:
-                failed.append(code)
-            elif rows:
+            if rows:
                 ok_rows[code] = rows
+                n_ok += 1
+            else:
+                # 空结果原先被 `elif rows:` 静默吞掉（既不计数也不落失败清单）—— 已修正
+                failed[code] = reason
             if done % FLUSH_EVERY == 0:
                 flush()
-                with _print_lock:
-                    print(f"[{tag}] {done}/{len(targets)} fail={len(failed)} {time.time() - t0:.0f}s", flush=True)
+                print(f"[{tag}] {done}/{len(targets)} ok={n_ok} fail={len(failed)} "
+                      f"{time.time() - t0:.0f}s", flush=True)
     flush()
-    print(f"[{tag}] fail={len(failed)}/{len(targets)} | " +
+    reasons = Counter(failed.values())
+    print(f"[{tag}] {len(targets)} targets -> ok={n_ok} fail={len(failed)} "
+          f"({dict(reasons)}) in {time.time() - t0:.0f}s | " +
           ", ".join(f"{y}:{r}x{c}" for y, (r, c) in sorted(stat_all.items())), flush=True)
-    if failed:
-        fp = os.path.join(PRICE_DIR, "_failed.txt")
-        with open(fp, "a", encoding="utf-8") as f:
-            f.write("\n".join(f"{c}\t{tag}\t{time.strftime('%Y-%m-%d %H:%M')}" for c in failed) + "\n")
-        print(f"[{tag}] failed codes -> {fp}", flush=True)
-    return len(ok_rows), len(failed)
+    # 无论成功与否都写状态文件（全成功时清空上一轮遗漏的失败清单，避免陈旧记录误导）
+    _write_status(tag, targets, n_ok, failed, reasons)
+    return reasons
+
+
+def _write_status(tag, targets, n_ok, failed, reasons):
+    """把失败原因写入 output/（随提交入库，云端运行结果可直接核查）"""
+    out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+    os.makedirs(out_dir, exist_ok=True)
+    fp = os.path.join(out_dir, f"price_fetch_status_{tag}.csv")
+    import csv
+    with open(fp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["code", "reason", "run_at"])
+        now = time.strftime("%Y-%m-%d %H:%M")
+        for c, r in sorted(failed.items()):
+            w.writerow([c, r, now])
+    print(f"[{tag}] status -> {fp} | targets={len(targets)} ok={n_ok} "
+          f"fail={len(failed)} reasons={dict(reasons)}", flush=True)
 
 
 def main():
@@ -265,6 +361,9 @@ def main():
             daily = daily + extra
         if args.full:
             full = all_codes
+        # 顺序很关键：当前成分先抓。若再遇限流导致队列被截断，被牺牲的是历史成分
+        # （只影响历史回测精度），而不是今天算每日权重就需要的当前成分。
+        full = ([c for c in full if c in cur] + [c for c in full if c not in cur])
         targets = [(c, FULL_BARS) for c in full] + [(c, TAIL_BARS) for c in daily]
     if args.limit:
         targets = targets[: args.limit]
