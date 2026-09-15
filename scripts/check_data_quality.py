@@ -163,12 +163,16 @@ def structure_checks():
             with open(_cfp, encoding="utf-8") as _f:
                 cs = json.load(_f)
             rows.append(dict(
-                item="抓取队列游标（当日增量组）",
-                value=f"起点 {cs.get('daily', 0)}/{cs.get('daily_len', 0)} 只（当日缺口 {cs.get('gap', 0)} 只）",
+                item="抓取队列游标（当日缺价组）",
+                value=(f"组内偏移 {cs.get('daily', 0)}"
+                       f"｜当日缺口 {cs.get('gap', 0)} 只"
+                       f"（未封顶时全组 {cs.get('gap_all', cs.get('gap', 0))} 只）"),
                 status="OK",
                 note=(f"最后运行 {cs.get('run_at', '')}｜参照日 {cs.get('last_day', '')}｜"
-                      f"本轮实际取用 {cs.get('done', 0)} 只；下一轮从该起点接着做（对组长取模轮转）——"
-                      f"若连续多轮起点不动且缺口不减，说明限流把单轮产出压到了 0")) )
+                      f"本轮实际取用 {cs.get('done', 0)} 只；下一轮从该偏移接着做（组内取模轮转）——"
+                      f"若连续多轮偏移不动且缺口不减，说明限流把单轮产出压到了 0。"
+                      f"注意游标只在'当日缺价'组内轮转，该组单轮最多做 PRICE_GAP_MAX 只，"
+                      f"以免吃光预算饿死后面的回补组")) )
         except Exception:
             pass
 
