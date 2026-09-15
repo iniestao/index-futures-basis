@@ -446,7 +446,9 @@ def run(targets, tag):
     from collections import Counter
     if not targets:
         print(f"[{tag}] nothing to fetch", flush=True)
-        return Counter()
+        return Counter(), 0     # 与正常路径同构：(reasons, done)。此前只返回 Counter()，
+                                # main() 里 reasons, done = run(...) 会直接 ValueError 崩溃，
+                                # 子进程非零退出 → run_daily 判失败 → 提交步骤被跳过，整轮数据丢失
     sess = requests.Session()
     ok_rows, failed = {}, {}
     done = 0
@@ -470,7 +472,11 @@ def run(targets, tag):
 
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         futs = {ex.submit(fetch_one, sess, c, n): c for c, n in targets}
-        for fu in as_completed(futs):
+        seen = set()
+
+        def collect(fu):
+            nonlocal done, n_ok
+            seen.add(fu)
             try:
                 code, rows, reason = fu.result()
             except Exception as e:                     # 编程错误必须可见，不得静默丢
@@ -490,12 +496,21 @@ def run(targets, tag):
                 flush()
                 print(f"[{tag}] {done}/{len(targets)} ok={n_ok} fail={len(failed)} "
                       f"{time.time() - t0:.0f}s", flush=True)
+
+        for fu in as_completed(futs):
+            collect(fu)
             if _over_budget():
                 el = time.time() - t0
                 print(f"[{tag}] stop early at {done}/{len(targets)} "
                       f"({el:.0f}s elapsed, cooled={_throttle['cooled']:.0f}s "
                       f"= {_throttle['cooled']/max(el,1)*100:.0f}% of elapsed)", flush=True)
                 break
+        # break 时可能已有 future 完成、但 as_completed 还没来得及 yield（最多 WORKERS-1 个）。
+        # 这些成果是花了请求换来的，不收就白丢了 —— 补收已完成者；
+        # 未完成者会在 shutdown(wait=True) 里以 skipped 快速返回，无需再等。
+        for fu in futs:
+            if fu not in seen and fu.done():
+                collect(fu)
     flush()
     n_skip = len(targets) - done
     reasons = Counter(failed.values())
@@ -595,6 +610,9 @@ def main():
     n_full = sum(1 for _, n in targets if n == FULL_BARS)
     n_tail = sum(1 for _, n in targets if n == TAIL_BARS)
     est = (n_full * 1.6 + n_tail * 0.9) / max(WORKERS, 1)      # 无节流下的粗略耗时（秒）
+    if RATE > 0:
+        est = max(est, len(targets) / RATE)   # 全局限速的硬地板：请求数 ÷ 速率
+                                              # （1 req/s 下 2600 只就要 ~44 分钟，est 不该再显示 13 分钟）
     print(f"universe={len(all_codes)} stored={len(have)} current={len(cur)} "
           f"-> full={n_full} tail={n_tail} | workers={WORKERS} delay={DELAY}s "
           f"rate={RATE}/s budget={BUDGET:.0f}s est={est/60:.0f}min (throttle-free)", flush=True)

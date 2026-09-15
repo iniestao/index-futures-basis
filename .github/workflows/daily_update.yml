@@ -62,6 +62,11 @@ jobs:
         run: python scripts/run_daily.py
 
       - name: Commit updated data
+        # 必须 always：pipeline 任何一步非零退出（如某个脚本崩溃），默认的 success()
+        # 条件会跳过本步骤，导致**已成功环节的数据也一并丢失**（2026-09-14 被 cancel 时
+        # 就发生过整轮零产出）。本项目的抓取按「部分数据 > 零数据、缺口下轮自愈」设计，
+        # 部分失败也该把已抓到的提交入库。
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

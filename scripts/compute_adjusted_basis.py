@@ -289,8 +289,6 @@ def load_events(product, index_code):
             col_p.append(y_pfix if np.isfinite(y_pfix) else v0)
             col_pq.append(y_pqfix if np.isfinite(y_pqfix) else v0)
             col_epsq.append(eps_target if np.isfinite(eps_target) else np.nan)
-    ev["yield_true"] = ev["yield_dec"].fillna(ev["yield_dec"].groupby(ev["code"]).transform(
-        lambda s: s.shift(1)))
     ev["yield_true"] = ev["yield_dec"]  # 真值列（NaN 行在覆盖率统计中自然处理）
     ev["y_pred_v0"] = col_v0       # 上年递推（对照）
     ev["y_fix_y"] = col_y          # 固定股息率
