@@ -9,7 +9,7 @@
 异常会打印 GitHub Actions 注解（::warning::），并在报告中标 WARN；始终以 0 退出，不阻断流水线。
 用法：python scripts/check_data_quality.py
 """
-import os, sys, glob
+import os, sys, glob, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import RAW, OUT, PRODUCTS, env_setup, INDEX_MEMBERS
 env_setup()
@@ -147,13 +147,30 @@ def structure_checks():
                     n2 = (f"{d_last} 有价 {n_last}/{len(cols)} 只，前一交易日({d_prev}) {n_prev} 只 "
                           f"({r*100:.0f}%)")
                     if st2 == "WARN":
-                        n2 += "；当日增量未跑完 → 当日权重会退化为上一日价格，可再跑一次补齐"
+                        n2 += ("；当日增量被限流截断 → 当日权重会退化为上一日价格。"
+                               "队列已按「当日缺口优先」排序并带游标轮转，下次运行会自动接着补齐")
                         warns.append(f"最新交易日价格覆盖骤降（{n_last}/{n_prev}），当日增量可能被截断")
                     rows.append(dict(item="最新交易日价格填充（当前成分）", value=n2.split("；")[0],
                                      status=st2, note=n2))
             except Exception as e:
                 rows.append(dict(item="最新交易日价格填充（当前成分）", value="检查失败",
                                  status="WARN", note=f"{type(e).__name__}: {e}"))
+
+        # ---- 抓取队列游标：当日增量组下一轮从哪继续（用于判断是否在"原地打转"）----
+        try:
+            _cfp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "output", "price_cursor.json")
+            with open(_cfp, encoding="utf-8") as _f:
+                cs = json.load(_f)
+            rows.append(dict(
+                item="抓取队列游标（当日增量组）",
+                value=f"起点 {cs.get('daily', 0)}/{cs.get('daily_len', 0)} 只（当日缺口 {cs.get('gap', 0)} 只）",
+                status="OK",
+                note=(f"最后运行 {cs.get('run_at', '')}｜参照日 {cs.get('last_day', '')}｜"
+                      f"本轮实际取用 {cs.get('done', 0)} 只；下一轮从该起点接着做（对组长取模轮转）——"
+                      f"若连续多轮起点不动且缺口不减，说明限流把单轮产出压到了 0")) )
+        except Exception:
+            pass
 
         # ---- 每品种：每日权重是否真正生效（这是最该看的指标）----
         # 判据用**权重覆盖率**：缺的可能是权重很大的成分（2026-09-13 云端即如此，

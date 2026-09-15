@@ -7,10 +7,14 @@
         「送转股份-送转总比例」做联动修正（见 scripts/weight_daily.py），此处不做复权。
 存储：data_raw/stock_prices/close_YYYY.csv —— (日期行 × 代码列) 宽表，值=收盘价。
       宽表按年切分，每日只重写当年文件且只追加 1 行，git 增量约 30KB/日，仓库体积增长可控。
-抓取策略：
-      - 无任何存储记录的代码（新纳入 universe / 历史成分）→ 全量 3000 根
-      - 当前成分（四指数最新月末文件 ∪ 快照）→ 增量 45 根（自愈最近缺口）
-      - --sweep 全量 universe 45 根（周期性兜底，捕捉重新纳入的成分）
+抓取策略（队列按「当日价值 / 抓取成本」分四层，详见 main() 内注释）：
+      - 当前成分 × 当日缺价        → 增量 45 根（当日价格是看板硬需求，最先做完）
+      - 当前成分 × 无存储记录      → 全量 3000 根（决定每日权重的覆盖率）
+      - 当前成分 × 当日已有价      → 增量 45 根（自愈该股近期其他缺口）
+      - 历史成分 × 无存储记录      → 全量 3000 根（只影响历史精度，最后做）
+      - --sweep 追加全量 universe 45 根（周期性兜底，捕捉重新纳入的成分）
+      单轮运行必然在限流/预算处被截断，故当日增量组带队列游标（output/price_cursor.json）
+      轮转起点：否则每次都从固定队头开始，被截断的永远是同一批队尾代码。
 """
 import os, sys, json, time, argparse, threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -47,12 +51,25 @@ COOLDOWN_MAX = float(os.environ.get("PRICE_COOLDOWN_MAX", "300"))
 # 早期版本只看 cooled ≥ 900s，把后者也砍了 —— 2026-09-14 首次回补即如此：
 # 446/2922 只后中止，队列后段的「当日增量」完全没跑，当日价格大面积为空。
 COOLDOWN_TOTAL_MIN = float(os.environ.get("PRICE_COOLDOWN_TOTAL", "900"))
-COOLDOWN_DOMINANCE = float(os.environ.get("PRICE_COOLDOWN_DOMINANCE", "0.6"))
+# 冷却主导阈值：冷却累计 ≥ 该比例 × 本轮已用时长即收尾。
+# 云端实测（2026-09-14 三次运行各约 50 分钟）真正耗时的是限流等待，收尾判据本身合理；
+# 从 0.6 放宽到 0.75 是为了让单轮在持续限流下也能多推进一些 —— 配合队列轮转，
+# 单轮产出越多，全量覆盖所需的轮数越少。
+COOLDOWN_DOMINANCE = float(os.environ.get("PRICE_COOLDOWN_DOMINANCE", "0.75"))
 EMPTY_STREAK_TRIGGER = int(os.environ.get("PRICE_EMPTY_STREAK", "20"))  # 连续空到这个数即判定为被限流
 ATTEMPTS = int(os.environ.get("PRICE_ATTEMPTS", "4"))
 # 新浪被限流时每个失败代码都会走腾讯兜底，请求量会放大 2~3 倍、把限流拖得更久。
 # 给兜底设每轮次数上限，超限即视为本轮拿不到。
 TENCENT_MAX = int(os.environ.get("PRICE_TENCENT_MAX", "200"))
+
+# 队列游标（入库，随数据一起提交）。记录「当日增量」队列上次的起点位置。
+# 为什么需要它：单轮运行必然会在限流/预算处被截断，而队列若每次都从固定队头开始，
+# 被截断的永远是同一批队尾代码 —— 2026-09-14 实测：daily 队列 1564 只，
+# 「升序前 801 只」与实际拿到当日价的代码重合 800/801（99.9%），
+# 队尾 763 只（几乎全部 601/603/605/688 段）连续三轮运行零进展，
+# 且排在后面的回补队列一次都没轮到（价格面板覆盖连续三轮卡在 2398 只不动）。
+CURSOR_FP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "output", "price_cursor.json")
 
 _throttle = {"until": 0.0, "strikes": 0, "empty_streak": 0, "cooled": 0.0, "tencent": 0}
 _deadline = 0.0        # run() 开始时设定为 t0 + BUDGET
@@ -195,6 +212,52 @@ def current_constituents():
     return codes
 
 
+def last_day_priced():
+    """
+    返回 (面板最后一个交易日, 该日有价的代码集合)。
+    用途：把「当日缺价」的代码排到队列最前 —— 当日价格是看板的硬需求，
+    而历史缺口可以慢慢补。注意参照日取自面板自身（而非外部日历），
+    这样即使数据源当日尚未更新，判定也只是退化为"全都缺"，不会出错。
+    """
+    import datetime as dt
+    fp = year_path(dt.date.today().year)
+    if not os.path.exists(fp):
+        return None, set()
+    try:
+        df = pd.read_csv(fp, index_col=0, dtype={0: str})
+    except Exception:
+        return None, set()
+    if df.empty:
+        return None, set()
+    df.index = df.index.astype(str)
+    return str(df.index[-1])[:10], set(df.columns[df.iloc[-1].notna()])
+
+
+def _rotate(lst, k):
+    """按 k 位置轮转队列：把上次处理过的部分挪到队尾，避免队尾永久饥饿"""
+    if not lst:
+        return lst
+    k %= len(lst)
+    return lst[k:] + lst[:k]
+
+
+def _load_cursor():
+    try:
+        with open(CURSOR_FP, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_cursor(d):
+    try:
+        os.makedirs(os.path.dirname(CURSOR_FP), exist_ok=True)
+        with open(CURSOR_FP, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  [cursor] write failed: {e}", flush=True)
+
+
 def fetch_tencent(sess, code, start_date="2015-01-01", batches=5):
     """
     腾讯日 K 兜底（新浪不可用时）。腾讯单次最多 800 根，按日期区间往前翻页。
@@ -329,8 +392,9 @@ def upsert(new_by_code):
 def run(targets, tag):
     """
     targets: list[(code, bars)]；分批落盘，中断也不丢已抓数据。
-    返回 Counter({reason: n})，并写出**入库的**状态文件（原先的 _failed.txt 被 .gitignore
-    排除，云端失败原因完全不可见；改写到 output/ 下随数据一起提交）。
+    返回 (Counter({reason: n}), done)：done 是本轮实际取用（含 skipped 之外）的任务数，
+    由 main() 用来推进队列游标。同时写出**入库的**状态文件（原先的 _failed.txt 被
+    .gitignore 排除，云端失败原因完全不可见；改写到 output/ 下随数据一起提交）。
     """
     from collections import Counter
     if not targets:
@@ -395,7 +459,7 @@ def run(targets, tag):
               flush=True)
     # 无论成功与否都写状态文件（全成功时清空上一轮遗漏的失败清单，避免陈旧记录误导）
     _write_status(tag, targets, n_ok, failed, reasons)
-    return reasons
+    return reasons, done
 
 
 def _write_status(tag, targets, n_ok, failed, reasons):
@@ -429,6 +493,7 @@ def main():
 
     if args.codes:
         targets = [(c.strip(), FULL_BARS) for c in args.codes.split(",") if c.strip()]
+        daily, last_day, n_gap, k = [], None, 0, 0
     else:
         full = [c for c in all_codes if c not in have]
         daily = [c for c in sorted(cur) if c in have and sina_symbol(c)]
@@ -437,17 +502,34 @@ def main():
             daily = daily + extra
         if args.full:
             full = all_codes
-        # 顺序很关键，按「对当日产品的价值 / 抓取成本」排序：
-        #   ② 当前成分 × 已有记录 → 增量 45 根：最便宜（1 请求/只），保证"今天"的价格不缺。
-        #      必须排在回补之前 —— 回补是 3000 根/只 的昂贵操作，一旦预算被它耗尽，
-        #      当日价格就会整体滞后一日（2026-09-14 实况：回补吃掉全部时间，
-        #      2294 只里只有 446 只有当日价，当日增量一只没跑）。
-        #   ① 当前成分 × 无落库记录 → 补 3000 根：决定每日权重的覆盖率，其次做。
-        #   ③ 历史成分 × 无落库记录 → 回补历史精度，最后做（其权重多为 0）。
         full_cur = [c for c in full if c in cur]
         full_hist = [c for c in full if c not in cur]
-        targets = ([(c, TAIL_BARS) for c in daily]
+
+        # 队列顺序按「对当日产品的价值 / 抓取成本」排序，但要两层一起看：
+        #
+        # 第一层 价值优先（决定"先做什么"）：
+        #   ① 当前成分 × 当日缺价（增量 45 根）：当日价格是看板的硬需求，必须最先做完。
+        #   ② 当前成分 × 无落库记录（3000 根）：决定每日权重的覆盖率；且无记录必然也缺当日价。
+        #   ③ 当前成分 × 当日已有价（增量 45 根）：自愈该股近期其他缺口，对权重覆盖率有直接帮助。
+        #   ④ 历史成分 × 无落库记录（3000 根）：只影响历史精度（其权重多为 0），最后做。
+        # 注：早期版本把"全部当前成分"当作一个 45 根的大组（不分当日是否有价），
+        # 在限流下光这一组就用光预算，回补队列三轮一次都没轮到（价格面板覆盖卡死在 2398 只）。
+        #
+        # 第二层 队列轮转（决定"从哪个开始"）—— 轮转只作用于当日增量组，因为它是**每天重置**
+        # 的长队列；至于 full_* 两组，抓成功即进入 stored_codes、下轮自动退出队列，天然收敛。
+        # 不轮转会怎样：单轮必然在限流/预算处被截断，若队列每次从固定队头开始，
+        # 被截断的永远是同一批队尾代码（2026-09-14 实测重合度 800/801 = 99.9%），
+        # 队尾 763 只（601/603/605/688 段）连续三轮零进展。
+        last_day, has_last = last_day_priced()
+        curs = _load_cursor()
+        k = int(curs.get("daily", 0) or 0)
+        daily_rot = _rotate(daily, k)
+        gap = [c for c in daily_rot if c not in has_last]
+        rest = [c for c in daily_rot if c in has_last]
+        n_gap = len(gap)
+        targets = ([(c, TAIL_BARS) for c in gap]
                    + [(c, FULL_BARS) for c in full_cur]
+                   + [(c, TAIL_BARS) for c in rest]
                    + [(c, FULL_BARS) for c in full_hist])
     if args.limit:
         targets = targets[: args.limit]
@@ -458,7 +540,20 @@ def main():
     print(f"universe={len(all_codes)} stored={len(have)} current={len(cur)} "
           f"-> full={n_full} tail={n_tail} | workers={WORKERS} delay={DELAY}s "
           f"budget={BUDGET:.0f}s est={est/60:.0f}min (throttle-free)", flush=True)
-    run(targets, "prices")
+    if not args.codes:
+        print(f"  queue: 当日({last_day})缺价={n_gap} | 当前成分缺记录={len(full_cur)} "
+              f"| 当日有价自愈={len(rest)} | 历史成分缺记录={len(full_hist)} "
+              f"| daily cursor={k}/{len(daily)}", flush=True)
+    reasons, done = run(targets, "prices")
+    if not args.codes and daily:
+        # 游标只按"本轮实际取用数"前进；当日增量组跑完则归零（下一轮重新从头，但那时
+        # 队首多半已是新一轮的缺价代码）。done ≥ len(daily) 意味着已越过整组、
+        # 进入后面的回补组，游标自然归零。
+        new_k = (k + done) % len(daily) if done < len(daily) else 0
+        _save_cursor({"daily": new_k, "daily_len": len(daily), "gap": n_gap,
+                      "last_day": last_day or "", "done": done,
+                      "run_at": time.strftime("%Y-%m-%d %H:%M")})
+        print(f"[cursor] daily {k} -> {new_k} (done={done}/{len(targets)})", flush=True)
     print("DONE", flush=True)
 
 
