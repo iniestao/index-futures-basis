@@ -3,7 +3,7 @@
 import os, sys, datetime as dt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import RAW, OUT, PRODUCTS, START, END, third_friday, env_setup
-from compute_adjusted_basis import four_contracts_for_day, load_events, build_est_ex, load_weight_timeline, load_snapshot_weights, get_weight_vec
+from compute_adjusted_basis import four_contracts_for_day, build_events, load_weight_timeline, load_snapshot_weights, get_weight_vec
 env_setup()
 import numpy as np
 import pandas as pd
@@ -27,7 +27,7 @@ def main():
         sidx = sidx[(sidx["date"] >= "2024-06-01") & (sidx["date"] <= "2025-12-31")].reset_index(drop=True)
         dates = sidx["date"].tolist()
         closes = sidx["close"].to_numpy(float)
-        ev = build_est_ex(load_events(prod, cfg["index"]))
+        ev = build_events(prod, cfg["index"])
         dser0 = dt.date.fromisoformat(dates[0])
         e_ann = np.array([np.nan if pd.isna(x) else (x.date() - dser0).days for x in pd.to_datetime(ev["ann"])], float)
         e_ex = np.array([np.nan if pd.isna(x) else (x.date() - dser0).days for x in pd.to_datetime(ev["est_ex"])], float)

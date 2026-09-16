@@ -318,7 +318,85 @@ def build_est_ex(ev):
     ev["est_ex"] = pd.Series(out, index=ev.index)
     return ev
 
+
+def add_prediction_candidates(ev, ahead_days=400, back_days=30, min_gap_days=60, per_stock_max=3):
+    """
+    为「尚未公告的未来分红」合成预测候选事件 —— 实现文档 §3 状态机中
+    「候选 → 未公告 → 预测引擎」分支。
+
+    缺口（2026-09-16 定位）：事件池只含已公告行，而四口径仅对 ann > t 的
+    事件分化（pred_sel）。t 逼近数据末端时 ann > t 的事件必然趋空
+    （2026-08-31 中报披露截止后 announced_ratio 恒为 1.0、四口径全同），
+    当下 DPV 系统性漏算窗口内未公告分红 → basis_adj 高估。
+    （历史 t 不受影响：那时的"未来公告"如今都已在池里。）
+
+    做法：对每只股票，将其历史 est_ex 各自做周年外推（+365k 天，k=1..3），
+    保留落在 [today-back_days, today+ahead_days] 窗内、且与已有事件
+    （含已生成候选）est_ex 间隔 ≥ min_gap_days 的首个候选 —— 判重保证
+    凡池里已有真实事件的空档不重复生成（历史回测面板因此几乎不变）；
+    候选四口径收益继承该股最新真实事件的 y_fix_*（基于其前三次历史均值，
+    对当下时点无前视）；ann = est_ex − 该股预案→除息中位间隔（未来日期，
+    天然落进 pred_sel）。
+    """
+    today = pd.Timestamp(dt.date.today())
+    lo, hi = today - pd.Timedelta(days=back_days), today + pd.Timedelta(days=ahead_days)
+    med_iv = (pd.to_datetime(ev["ex"]) - pd.to_datetime(ev["ann"])).dt.days
+    cols = list(ev.columns)
+    new_rows = []
+    for c, g in ev.groupby("code", sort=False):
+        real = pd.to_datetime(g["est_ex"]).dropna()
+        if real.empty:
+            continue
+        # 继承源：最新真实事件（按公告日）的四口径预测；中位间隔回退 60 天
+        gl = g[g["ann"].notna()]
+        if gl.empty:
+            continue
+        last = gl.loc[gl["ann"].idxmax()]
+        miv = med_iv.loc[g.index].median()
+        miv = float(miv) if pd.notna(miv) and miv > 0 else 60.0
+        taken = list(real)
+        n = 0
+        for base in real.sort_values():
+            for k in (1, 2, 3):
+                cand = base + pd.Timedelta(days=365 * k)
+                if cand > hi:
+                    break
+                if cand < lo:
+                    continue
+                if any(abs((t - cand).days) < min_gap_days for t in taken):
+                    continue
+                row = {col: np.nan for col in cols}
+                row.update(code=c, ann=cand - pd.Timedelta(days=miv), ex=pd.NaT,
+                           est_ex=cand, candidate=1,
+                           y_pred_v0=last["y_pred_v0"], y_fix_y=last["y_fix_y"],
+                           y_fix_d=last["y_fix_d"], y_fix_p=last["y_fix_p"],
+                           y_fix_pq=last["y_fix_pq"], eps_est_q=last["eps_est_q"])
+                new_rows.append(row)
+                taken.append(cand)
+                n += 1
+                break
+            if n >= per_stock_max:
+                break
+    if not new_rows:
+        return ev
+    out = pd.concat([ev, pd.DataFrame(new_rows)], ignore_index=True)
+    out["_is_candidate"] = out.get("candidate", pd.Series(0, index=out.index)).fillna(0).astype(int)
+    return out.drop(columns=["candidate"], errors="ignore")
+
+
+def build_events(product, index_code):
+    """统一入口：事件池 → est_ex → 未公告候选。main 与 compute_backtest 共用。"""
+    return add_prediction_candidates(build_est_ex(load_events(product, index_code)))
+
 # ---------- 主流程 ----------
+# 面板固定列序：pd.DataFrame(recs) 的列序取决于首个 dict 的键序，而
+# 「窗口内无事件」分支与正常分支的键序不同（calibre 位置不一致），曾导致
+# IF/IH 与 IC/IM 的 panel 列顺序不一致（2026-09-16 用户发现）。输出前统一重排。
+PANEL_COLUMNS = ["date", "product", "role", "contract", "expire", "spot", "future",
+                 "basis_raw", "calibre", "dpv_pts", "basis_adj", "annualized_rate",
+                 "announced_ratio"]
+
+
 def main(end_date=None, out_suffix=""):
     fut = pd.read_csv(FUT_CSV, header=None,
                       names=["date", "symbol", "open", "high", "low", "close",
@@ -338,7 +416,7 @@ def main(end_date=None, out_suffix=""):
         dates = sidx["date"].tolist()
         closes = sidx["close"].to_numpy(dtype=float)
 
-        ev = build_est_ex(load_events(prod, cfg["index"]))
+        ev = build_events(prod, cfg["index"])
         if len(ev) == 0:
             print(f"[WARN] no events for {prod}")
             continue
@@ -429,7 +507,7 @@ def main(end_date=None, out_suffix=""):
                     recs.append(dict(**out_row_base, calibre=k, dpv_pts=dpv_pts,
                                      basis_adj=(Fv - S) + dpv_pts, annualized_rate=ann_rate,
                                      announced_ratio=cov))
-        panel = pd.DataFrame(recs)
+        panel = pd.DataFrame(recs).reindex(columns=PANEL_COLUMNS)
         all_panels.append(panel)
         suffix = f"_{out_suffix}" if out_suffix else ""
         panel.to_csv(os.path.join(OUT, f"{prod}_panel{suffix}.csv"), index=False, encoding="utf-8-sig")
