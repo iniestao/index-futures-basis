@@ -3,7 +3,7 @@
 日频计算四个股指期货品种的**剔除分红后基差**：`B_adj = 表观基差 B + DPV = F − (S − DPV)`。
 全部基于公开数据（中金所官网、中证指数公司、新浪财经、东方财富 F10），GitHub Actions 每日自动更新，Streamlit 看板可视化。
 
-**方法论详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md)**（含公式、数据流图、状态机图、回测结果）。
+**方法论详见 [docs/METHODOLOGY.md](docs/METHODOLOGY.md)**（含公式、数据流图、状态机图、回测结果、§8 系统技术设计：模块架构 / 运行时序 / 状态持久化 / 可靠性设计模式）。
 
 ## 架构
 
