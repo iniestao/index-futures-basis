@@ -211,6 +211,43 @@ def structure_checks():
                 note=f"axis={n_axis}，阈值 权重≥{MIN_W_COV*100:.0f}% 且计数≥{MIN_PRICE_COV*100:.0f}%"))
             if not ok:
                 warns.append(f"{prod} 每日权重未生效：权重覆盖 {w_cov*100:.1f}% < {MIN_W_COV*100:.0f}%")
+
+    # ---- 最新交易日四口径分化：面板末端的「全同」是预测候选缺失的指纹 ----
+    # 四口径只在预测态事件（ann > t）上分化。若事件池不含「未公告候选」，t 逼近数据
+    # 末端时 pred_sel 必然趋空 → 当下四口径全同 + 窗口内未公告分红整体漏算
+    # （2026-09-16 实况：announced_ratio 恒 1.0，DPV 漏算近半）。历史时点不受影响，
+    # 回测 MAE 永远探不到 —— 只能盯面板末端这一天。
+    rows.append(dict(item="最新交易日四口径分化", value="", status="",
+                     note="全同 = 预测候选缺失 = 当下 DPV 漏算未公告分红（历史回测探不到，只能盯末端）"))
+    for prod in PRODUCTS:
+        fp = os.path.join(OUT, f"{prod}_panel.csv")
+        if not os.path.exists(fp):
+            continue
+        try:
+            dfa = pd.read_csv(fp, dtype={"date": str, "contract": str}).dropna(subset=["dpv_pts"])
+        except Exception as e:
+            rows.append(dict(item=f"  {prod}", value="检查失败", status="WARN",
+                             note=f"{type(e).__name__}: {e}"))
+            continue
+        if not len(dfa):
+            continue
+        last_day = dfa["date"].max()
+        d = dfa[dfa["date"] == last_day]
+        g = d.groupby("contract")["dpv_pts"].agg(["nunique", "count"])
+        g = g[g["count"] >= 4]          # 四口径齐全的合约才可比
+        if not len(g):
+            continue
+        n_diff = int((g["nunique"] > 1).sum())
+        ar = pd.to_numeric(d["announced_ratio"], errors="coerce")
+        ar_min = float(ar.min()) if ar.notna().any() else np.nan
+        ok = n_diff >= 1                # 近月无分红窗口内全同属正常，只要求至少一个合约互异
+        note = (f"{last_day}：{n_diff}/{len(g)} 个合约四口径互异"
+                + (f"；announced_ratio 最低 {ar_min:.2f}" if np.isfinite(ar_min) else ""))
+        if not ok:
+            note += ("；全部全同 → 未公告候选缺失，当下 DPV 漏算窗口内未公告分红")
+            warns.append(f"{prod} 面板末端（{last_day}）四口径全同：预测候选缺失，当下 DPV 漏算未公告分红")
+        rows.append(dict(item=f"  {prod}", value=f"{n_diff}/{len(g)} 合约互异",
+                         status="OK" if ok else "WARN", note=note))
     return pd.DataFrame(rows), warns
 
 
