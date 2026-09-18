@@ -543,6 +543,7 @@ def _write_status(tag, targets, n_ok, failed, reasons):
 
 
 def main():
+    _t0 = time.time()      # 本步总耗时（含队列构建），写入游标供事后核查
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep", action="store_true", help="全量 universe 增量刷新（周期性兜底）")
     ap.add_argument("--full", action="store_true", help="强制全量回溯所有 universe 代码")
@@ -627,9 +628,14 @@ def main():
         # 整组（gap_all）都被消费过则归零 —— 下一轮多半已是一批新的缺价代码。
         used = min(done, n_gap)
         new_k = (k + used) % len(gap_all) if gap_all and used < len(gap_all) else 0
+        # elapsed/cooled 入库：区分"限速地板（1800 只 × 1 req/s ≈ 30 分钟，正常）"
+        # 与"被限流冷却拖长（cooled 占比高，外部波动）"，不用再翻不可读的 Actions 日志。
+        n_fail = int(sum(reasons.values()))
         _save_cursor({"daily": new_k, "daily_len": len(daily), "gap": n_gap,
                       "gap_all": len(gap_all), "last_day": last_day or "",
-                      "done": done, "run_at": time.strftime("%Y-%m-%d %H:%M")})
+                      "done": done, "run_at": time.strftime("%Y-%m-%d %H:%M"),
+                      "elapsed_s": round(time.time() - _t0), "cooled_s": round(_throttle["cooled"]),
+                      "ok": done - n_fail, "failed": n_fail})
         print(f"[cursor] gap {k} -> {new_k} (used={used}/{n_gap}, done={done}/{len(targets)})",
               flush=True)
     print("DONE", flush=True)
