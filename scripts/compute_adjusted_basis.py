@@ -238,6 +238,21 @@ def load_events(product, index_code):
     ev = pd.DataFrame(rows, columns=["code", "ann", "ex", "yield_dec", "dps", "eps"])
     ev = ev.sort_values(["code", "ann"]).reset_index(drop=True)
 
+    # ---- 分红类型标签（中期 vs 年报）----
+    # A 股年报分红除息集中在 5-8 月，其余（9 月~次年 4 月）为中期/特别分红。
+    # 用「除息日」判定；除息日为空（已公告未实施）的事件按「预案公告日」推断：
+    #   7-12 月公告的多为中期/特别分红（当年），1-6 月公告的多为上年年报分红。
+    # is_mid=1 表中期/特别，0 表年报。候选生成与股息率校准都按此类型分别建模。
+    ex_dt = pd.to_datetime(ev["ex"], errors="coerce")
+    ann_dt = pd.to_datetime(ev["ann"], errors="coerce")
+    m_ex = ex_dt.dt.month
+    m_ann = ann_dt.dt.month
+    ev["is_mid"] = np.where(
+        ex_dt.notna(),
+        ~m_ex.between(5, 8),          # 有除息日：5-8 月=年报(0)，其余=中期(1)
+        ~m_ann.between(1, 6),         # 无除息日：7-12 月公告=中期(1)，1-6 月=年报(0)
+    ).astype(int)
+
     # ---- 四种预测收益率（均为信息集内无前视）----
     qeps = load_eps_quarterly()
     col_v0, col_y, col_d, col_p, col_pq, col_epsq = [], [], [], [], [], []
@@ -319,7 +334,7 @@ def build_est_ex(ev):
     return ev
 
 
-def add_prediction_candidates(ev, ahead_days=400, back_days=30, min_gap_days=60, per_stock_max=3):
+def add_prediction_candidates(ev, ahead_days=400, back_days=30, per_stock_max=2):
     """
     为「尚未公告的未来分红」合成预测候选事件 —— 实现文档 §3 状态机中
     「候选 → 未公告 → 预测引擎」分支。
@@ -330,13 +345,18 @@ def add_prediction_candidates(ev, ahead_days=400, back_days=30, min_gap_days=60,
     当下 DPV 系统性漏算窗口内未公告分红 → basis_adj 高估。
     （历史 t 不受影响：那时的"未来公告"如今都已在池里。）
 
-    做法：对每只股票，将其历史 est_ex 各自做周年外推（+365k 天，k=1..3），
-    保留落在 [today-back_days, today+ahead_days] 窗内、且与已有事件
-    （含已生成候选）est_ex 间隔 ≥ min_gap_days 的首个候选 —— 判重保证
-    凡池里已有真实事件的空档不重复生成（历史回测面板因此几乎不变）；
-    候选四口径收益继承该股最新真实事件的 y_fix_*（基于其前三次历史均值，
-    对当下时点无前视）；ann = est_ex − 该股预案→除息中位间隔（未来日期，
-    天然落进 pred_sel）。
+    中期分红显式建模（2026-09-30 重构）：
+    之前把「历史所有 est_ex」各自 +365k 周年外推，未区分分红类型，导致
+    ①年报除息日被机械映射到次年 1-2 月（分红真空期，凭空造出候选）；
+    ②同一类型被 +365/+730/+1095 外推多期，候选数量膨胀 60%；
+    ③已公告的中期分红与「下一期同类」候选对同一股票重复计息（34 只重叠）。
+    重构后：
+      1. 按 is_mid 分组，年报历史只外推年报候选、中期历史只外推中期候选；
+      2. 每类型只外推「最近一期」的下一期（+365 一次），而非三期；
+      3. 强判重：该类型已有「已公告的未来事件」（ann 已出、est_ex 在未来）
+         落窗，则同类候选不再生成——已公告事件已占据该类型的下一期分红。
+    候选四口径股息率继承该股「同类型历史真实事件」的中位数（_type_predict_yields，
+    见下），ann = est_ex − 预案→除息中位间隔（未来日期，天然落 pred_sel）。
     """
     today = pd.Timestamp(dt.date.today())
     lo, hi = today - pd.Timedelta(days=back_days), today + pd.Timedelta(days=ahead_days)
@@ -344,44 +364,112 @@ def add_prediction_candidates(ev, ahead_days=400, back_days=30, min_gap_days=60,
     cols = list(ev.columns)
     new_rows = []
     for c, g in ev.groupby("code", sort=False):
-        real = pd.to_datetime(g["est_ex"]).dropna()
-        if real.empty:
+        g_real = g[g["ex"].notna()].copy()
+        if g_real.empty:
             continue
-        # 继承源：最新真实事件（按公告日）的四口径预测；中位间隔回退 60 天
-        gl = g[g["ann"].notna()]
-        if gl.empty:
-            continue
-        last = gl.loc[gl["ann"].idxmax()]
+        _ex = pd.to_datetime(g_real["ex"])
+        g_real["_type"] = _ex.map(_div_type)
+        ref = g_real.loc[_ex.idxmax()]
         miv = med_iv.loc[g.index].median()
         miv = float(miv) if pd.notna(miv) and miv > 0 else 60.0
-        taken = list(real)
+
+        # 已公告的未来事件（ann 非空、est_ex 已估计到未来）：按类型登记，
+        # 用于强判重——该类型若已有已公告事件落窗，则不再外推同类候选。
+        announced_future = g[g["ann"].notna() & pd.to_datetime(g["est_ex"], errors="coerce").notna()]
+        af_types = set()
+        for _, r in announced_future.iterrows():
+            exd = pd.to_datetime(r["est_ex"], errors="coerce")
+            if pd.notna(exd) and lo <= exd <= hi:
+                af_types.add(int(r["is_mid"]) if pd.notna(r["is_mid"]) else int(_div_type(exd) == "interim"))
+
         n = 0
-        for base in real.sort_values():
-            for k in (1, 2, 3):
-                cand = base + pd.Timedelta(days=365 * k)
-                if cand > hi:
-                    break
-                if cand < lo:
-                    continue
-                if any(abs((t - cand).days) < min_gap_days for t in taken):
-                    continue
-                row = {col: np.nan for col in cols}
-                row.update(code=c, ann=cand - pd.Timedelta(days=miv), ex=pd.NaT,
-                           est_ex=cand, candidate=1,
-                           y_pred_v0=last["y_pred_v0"], y_fix_y=last["y_fix_y"],
-                           y_fix_d=last["y_fix_d"], y_fix_p=last["y_fix_p"],
-                           y_fix_pq=last["y_fix_pq"], eps_est_q=last["eps_est_q"])
-                new_rows.append(row)
-                taken.append(cand)
-                n += 1
-                break
+        # 按分红类型分别外推：年报（is_mid=0）与中期（is_mid=1）各只外推最近一期
+        for is_mid, type_name in ((0, "annual"), (1, "interim")):
             if n >= per_stock_max:
                 break
+            if is_mid in af_types:
+                # 该类型已有已公告未来事件占据窗口，不再外推（强判重）
+                continue
+            type_ex = _ex[_ex.map(_div_type) == type_name]
+            if type_ex.empty:
+                continue
+            base = type_ex.max()           # 该类型最近一次真实除息日
+            cand = base + pd.Timedelta(days=365)   # 下一期同类型
+            if not (lo <= cand <= hi):
+                continue
+            yp = _type_predict_yields(g_real, type_name, ref)
+            if yp is None:
+                continue
+            row = {col: np.nan for col in cols}
+            row.update(code=c, ann=cand - pd.Timedelta(days=miv), ex=pd.NaT,
+                       est_ex=cand, candidate=1, is_mid=is_mid,
+                       y_pred_v0=yp["y_fix_y"], y_fix_y=yp["y_fix_y"],
+                       y_fix_d=yp["y_fix_d"], y_fix_p=yp["y_fix_p"],
+                       y_fix_pq=yp["y_fix_pq"], eps_est_q=np.nan)
+            new_rows.append(row)
+            n += 1
     if not new_rows:
         return ev
     out = pd.concat([ev, pd.DataFrame(new_rows)], ignore_index=True)
     out["_is_candidate"] = out.get("candidate", pd.Series(0, index=out.index)).fillna(0).astype(int)
     return out.drop(columns=["candidate"], errors="ignore")
+
+
+def _div_type(d):
+    """分红类型：A 股年报分红除息集中在 5-8 月，其余（9 月~次年 4 月）为中期/特别分红。"""
+    return "annual" if 5 <= d.month <= 8 else "interim"
+
+
+def _type_predict_yields(real_g, div_type, ref):
+    """
+    基于「同分红类型的历史真实除息事件」计算候选的四口径预测股息率。
+
+    背景（2026-09-30）：候选原继承「最新真实事件的前三次全样本均值」，该均值
+    把 5-7 月年报大分红的高股息率与 9 月~次年 3 月中期分红的低股息率混在一起，
+    导致淡季窗口（9 月~次年 3 月，全是中期/特别分红）的候选股息率系统性虚高
+    50~73% → 中小盘（IC/IM）远月 DPV 高估 33~42%。改按「分红类型」分开建模：
+      annual（除息 5-8 月）候选继承历史 annual 事件，interim（其余）继承 interim。
+    淡季窗口候选天然全为 interim，股息率不再被年报大分红污染。
+
+    取**中位数**而非均值（对稀疏的延后年报/特别分红离群值更鲁棒）。四口径：
+      y   = median(yield_dec of 同类型)
+      d   = median(dps of 同类型) × (y_ref/d_ref)
+      p   = median(dps/eps of 同类型) × eps_ref × (y_ref/d_ref)
+      pq  = 降级为 p（候选无公告日，无法推季报外推 EPS 目标财年）
+    参考价基准 (y_ref,d_ref,eps_ref) 取该股「最近真实事件」。
+
+    无同类型历史（该股从无此类分红）返回 None → 调用方跳过该候选（真空期过滤）。
+    """
+    g = real_g
+    t = g["_type"]
+    y = g["yield_dec"].to_numpy(float)
+    d = g["dps"].to_numpy(float)
+    e = g["eps"].to_numpy(float)
+    p = np.where((e > 0) & np.isfinite(e), d / e, np.nan)
+    win = np.where(t == div_type)[0]
+    if win.size == 0:
+        return None
+    yv = y[win]; dv = d[win]; pv = p[win]
+    yv = yv[np.isfinite(yv)]; dv = dv[np.isfinite(dv)]; pv = pv[np.isfinite(pv)]
+    if yv.size == 0:
+        return None
+    y_fix = float(np.nanmedian(yv))
+    # 参考价基准（最近真实事件）
+    y_ref = float(ref["yield_dec"]) if np.isfinite(ref.get("yield_dec", np.nan)) else np.nan
+    d_ref = float(ref["dps"]) if np.isfinite(ref.get("dps", np.nan)) else np.nan
+    e_ref = float(ref["eps"]) if np.isfinite(ref.get("eps", np.nan)) else np.nan
+    P_ref_ok = np.isfinite(d_ref) and d_ref > 0 and np.isfinite(y_ref) and y_ref > 0
+    out = {"y_fix_y": y_fix}
+    if dv.size >= 1 and np.nanmedian(dv) > 0 and P_ref_ok:
+        out["y_fix_d"] = float(np.nanmedian(dv) * y_ref / d_ref)
+    else:
+        out["y_fix_d"] = y_fix
+    if pv.size >= 1 and np.nanmedian(pv) > 0 and P_ref_ok and np.isfinite(e_ref) and e_ref > 0:
+        out["y_fix_p"] = float(np.nanmedian(pv) * e_ref * y_ref / d_ref)
+    else:
+        out["y_fix_p"] = y_fix
+    out["y_fix_pq"] = out["y_fix_p"]   # 候选无公告日，pq 降级为 p
+    return out
 
 
 def build_events(product, index_code):
@@ -394,7 +482,7 @@ def build_events(product, index_code):
 # IF/IH 与 IC/IM 的 panel 列顺序不一致（2026-09-16 用户发现）。输出前统一重排。
 PANEL_COLUMNS = ["date", "product", "role", "contract", "expire", "spot", "future",
                  "basis_raw", "calibre", "dpv_pts", "basis_adj", "annualized_rate",
-                 "announced_ratio"]
+                 "ann_rate_raw", "announced_ratio"]
 
 
 def main(end_date=None, out_suffix=""):
@@ -487,7 +575,8 @@ def main(end_date=None, out_suffix=""):
                         recs.append(dict(date=dstr, product=prod, role=role, contract=sym,
                                          expire=T_day.isoformat(), spot=S, future=Fv,
                                          basis_raw=Fv - S, dpv_pts=0.0, basis_adj=Fv - S,
-                                         annualized_rate=np.nan, announced_ratio=np.nan, calibre=k))
+                                         annualized_rate=np.nan, ann_rate_raw=np.nan,
+                                         announced_ratio=np.nan, calibre=k))
                     continue
                 true_sel = sel_mask & (E_ANN <= tr)
                 pred_sel = sel_mask & ~true_sel
@@ -504,8 +593,10 @@ def main(end_date=None, out_suffix=""):
                     years = max((T_day - dd).days, 0) / 365.0
                     B_adj = (Fv - S) + dpv_pts
                     ann_rate = (B_adj / S / years * 100) if years > 0 and np.isfinite(Fv) else np.nan
+                    ann_rate_raw = ((Fv - S) / S / years * 100) if years > 0 and np.isfinite(Fv) else np.nan
                     recs.append(dict(**out_row_base, calibre=k, dpv_pts=dpv_pts,
                                      basis_adj=(Fv - S) + dpv_pts, annualized_rate=ann_rate,
+                                     ann_rate_raw=ann_rate_raw,
                                      announced_ratio=cov))
         panel = pd.DataFrame(recs).reindex(columns=PANEL_COLUMNS)
         all_panels.append(panel)
