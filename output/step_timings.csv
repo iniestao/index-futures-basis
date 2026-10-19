@@ -142,3 +142,14 @@ run_at,script,seconds,exit
 2026-10-18 19:51,compute_backtest.py,108,0
 2026-10-18 19:52,make_outputs.py,65,0
 2026-10-18 19:52,check_data_quality.py,6,0
+2026-10-19 21:12,fetch_weights.py,8,0
+2026-10-19 21:12,fetch_index_prices.py,8,0
+2026-10-19 21:12,fetch_cffex_monthly.py,2,0
+2026-10-19 21:31,fetch_dividends.py,1100,0
+2026-10-19 21:40,fetch_eps_annual.py,581,0
+2026-10-19 21:41,fetch_eps_quarterly.py,44,0
+2026-10-19 22:11,fetch_stock_prices.py,1803,0
+2026-10-19 22:12,compute_adjusted_basis.py,64,0
+2026-10-19 22:13,compute_backtest.py,50,0
+2026-10-19 22:14,make_outputs.py,41,0
+2026-10-19 22:14,check_data_quality.py,3,0
