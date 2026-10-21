@@ -3,10 +3,10 @@
   "daily_len": 1800,
   "gap": 2,
   "gap_all": 2,
-  "last_day": "2026-10-19",
+  "last_day": "2026-10-20",
   "done": 1800,
-  "run_at": "2026-10-20 21:03",
-  "elapsed_s": 1802,
+  "run_at": "2026-10-21 21:17",
+  "elapsed_s": 1803,
   "cooled_s": 0,
   "ok": 1800,
   "failed": 0
