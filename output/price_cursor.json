@@ -1,12 +1,12 @@
 {
   "daily": 0,
   "daily_len": 1800,
-  "gap": 5,
-  "gap_all": 5,
-  "last_day": "2026-10-27",
+  "gap": 4,
+  "gap_all": 4,
+  "last_day": "2026-10-28",
   "done": 1800,
-  "run_at": "2026-10-28 22:48",
-  "elapsed_s": 1803,
+  "run_at": "2026-10-29 22:18",
+  "elapsed_s": 1802,
   "cooled_s": 0,
   "ok": 1800,
   "failed": 0
